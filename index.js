@@ -14,6 +14,7 @@ import createSoakTest from './templates/soak.js';
 // Import utilities
 import { HttpClient } from './utils/http.js';
 import { BasicAuthManager, BearerTokenManager, ApiKeyManager, OAuth2Manager } from './utils/auth.js';
+import { ReportingAdapter, createReportingAdapter, reportPerformanceResults, createReportingHandleSummary } from './utils/reporting.js';
 import * as helpers from './utils/helpers.js';
 
 /**
@@ -84,6 +85,12 @@ export {
   BearerTokenManager,
   ApiKeyManager,
   OAuth2Manager,
+
+  ReportingAdapter,
+  createReportingAdapter,
+  reportPerformanceResults,
+  createReportingHandleSummary,
+  
   
   // Helper utilities
   helpers
