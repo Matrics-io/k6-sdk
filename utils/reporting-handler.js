@@ -32,7 +32,7 @@ export function createHandleSummary(testMetadata, options = {}) {
       results[filename] = htmlReport(data, {
         title: `${reportPrefix} - Performance Test Report`,
         description: testMetadata.description || `Performance test results for ${testMetadata.testName}`,
-        logo: 'https://k6.io/docs/static/img/k6-logo.svg'
+        logo: '../../docs/static/img/matrics-logo.png'
       });
       
       console.log(`📊 HTML report will be saved as: ${filename}`);
@@ -116,7 +116,7 @@ export function createHtmlReportSummary(testName, options = {}) {
       [`reports/${reportPrefix}_${timestamp}.html`]: htmlReport(data, {
         title: `${reportPrefix} - Performance Test Report`,
         description: testMetadata.description,
-        logo: 'https://k6.io/docs/static/img/k6-logo.svg'
+        logo: '../../docs/static/img/matrics-logo.png'
       }),
       'stdout': textSummary(data, { indent: ' ', enableColors: true })
     };
