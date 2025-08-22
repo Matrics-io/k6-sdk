@@ -1,5 +1,7 @@
 # k6 Performance Testing SDK
 
+[![version](https://img.shields.io/badge/version-1.1.2-blue.svg)](https://github.com/your-org/k6-perf-sdk/releases)
+
 A modular and reusable SDK for creating performance tests with k6. This SDK provides common test templates, configuration management, authentication helpers, HTTP and gRPC client utilities to streamline performance testing across multiple projects.
 
 ## Features
