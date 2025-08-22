@@ -9,18 +9,33 @@ import { sleep } from 'k6';
 import { check, group } from 'k6';
 
 /**
- * Default soak test options
+ * Default soak test options - up to 100 VUs
+ * Runs for extended periods to identify memory leaks and resource exhaustion
  */
 const defaultOptions = {
   stages: [
-    { duration: '2m', target: 10 },    // Ramp up to 10 users
-    { duration: '30m', target: 10 },   // Stay at 10 users for 30 minutes
-    { duration: '2m', target: 0 }      // Ramp down to 0 users
+    { duration: '5m', target: 50 },    // Ramp up to 50 users
+    { duration: '10m', target: 100 },  // Ramp up to 100 users
+    { duration: '2h', target: 100 },   // Stay at 100 users for 2 hours (soak period)
+    { duration: '5m', target: 50 },    // Ramp down to 50 users
+    { duration: '5m', target: 0 }      // Ramp down to 0 users
   ],
   thresholds: {
     http_req_duration: ['p(95)<1000', 'p(99)<1500'],
-    http_req_failed: ['rate<0.05']
-  }
+    http_req_failed: ['rate<0.05'],
+    http_reqs: ['rate>20'],           // Minimum requests per second
+    vus_max: ['value<=100'],          // Maximum VUs constraint
+    // Soak test specific thresholds
+    http_req_connecting: ['p(95)<100'], // Connection time should be stable
+    http_req_tls_handshaking: ['p(95)<200'], // TLS handshake should be stable
+    // Resource usage should remain stable over time
+    checks: ['rate>=0.95']            // Very high success rate expected
+  },
+  // Extended timeouts for long-running test
+  setupTimeout: '120s',
+  teardownTimeout: '120s',
+  // Batch metrics to reduce memory usage
+  summaryTrendStats: ['avg', 'min', 'med', 'max', 'p(95)', 'p(99)', 'count']
 };
 
 /**

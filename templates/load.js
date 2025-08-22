@@ -9,17 +9,30 @@ import { sleep } from 'k6';
 import { check, group } from 'k6';
 
 /**
- * Default load test options
+ * Default load test options - up to 600 VUs
+ * Simulates normal production load with gradual ramp-up
  */
 const defaultOptions = {
   stages: [
-    { duration: '1m', target: 500 },
-    { duration: '2m', target: 800 },
-    { duration: '1m', target: 0 },
+    { duration: '2m', target: 100 },   // Ramp up to 100 users
+    { duration: '5m', target: 300 },   // Ramp up to 300 users
+    { duration: '10m', target: 600 },  // Ramp up to 600 users (peak load)
+    { duration: '10m', target: 600 },  // Stay at 600 users
+    { duration: '5m', target: 300 },   // Ramp down to 300 users
+    { duration: '2m', target: 0 },     // Ramp down to 0 users
   ],
   thresholds: {
-    http_req_duration: ['p(95)<1000'],
-    http_req_failed: ['rate<0.05']
+    http_req_duration: ['p(95)<1000', 'p(99)<1500'],
+    http_req_failed: ['rate<0.05'],
+    http_reqs: ['rate>50'],           // Minimum requests per second
+    vus_max: ['value<=600']           // Maximum VUs constraint
+  },
+  ext: {
+    loadimpact: {
+      distribution: {
+        'amazon:us:ashburn': { loadZone: 'amazon:us:ashburn', percent: 100 }
+      }
+    }
   }
 };
 

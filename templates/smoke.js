@@ -10,14 +10,28 @@ import { check, group } from 'k6';
 
 /**
  * Default smoke test options
+ * Simple test to verify basic functionality with minimal load
  */
 const defaultOptions = {
-  vus: 1,
-  duration: '30s',
+  stages: [
+    { duration: '30s', target: 1 },   // Single user for 30 seconds
+    { duration: '1m', target: 5 },    // Ramp up to 5 users
+    { duration: '30s', target: 1 },   // Ramp down to 1 user
+    { duration: '10s', target: 0 }    // Ramp down to 0 users
+  ],
   thresholds: {
-    http_req_duration: ['p(95)<500'],
-    http_req_failed: ['rate<0.01']
-  }
+    http_req_duration: ['p(95)<500', 'p(99)<1000'],
+    http_req_failed: ['rate<0.01'],
+    http_reqs: ['rate>1'],            // At least 1 request per second
+    vus_max: ['value<=5'],            // Maximum 5 VUs for smoke test
+    checks: ['rate>=0.99'],           // 99% of checks should pass
+    // Connection stability checks
+    http_req_connecting: ['p(95)<50'],
+    http_req_receiving: ['p(95)<50']
+  },
+  // Quick timeouts for smoke tests
+  setupTimeout: '30s',
+  teardownTimeout: '30s'
 };
 
 /**
