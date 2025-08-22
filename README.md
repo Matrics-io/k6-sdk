@@ -1,6 +1,6 @@
 # k6 Performance Testing SDK
 
-A modular and reusable SDK for creating performance tests with k6. This SDK provides common test templates, configuration management, authentication helpers, and HTTP client utilities to streamline performance testing across multiple projects.
+A modular and reusable SDK for creating performance tests with k6. This SDK provides common test templates, configuration management, authentication helpers, HTTP and gRPC client utilities to streamline performance testing across multiple projects.
 
 ## Features
 
@@ -8,6 +8,7 @@ A modular and reusable SDK for creating performance tests with k6. This SDK prov
 - ⚙️ **Dynamic Configuration** - Support for .env files, JSON config, and runtime variables
 - 🔐 **Authentication Helpers** - Common auth flows and token management
 - 🌐 **HTTP Client Wrapper** - Built-in logging, metrics, and error handling
+- 🔌 **gRPC Client Wrapper** - Full gRPC support with same ergonomics as HTTP
 - 🧩 **Fully Modular** - Use just what you need or the entire SDK
 - 🔄 **Project Agnostic** - Works with any API or web application
 
@@ -213,6 +214,46 @@ sdk.utils.helpers.validateResponse(response, {
 });
 ```
 
+## gRPC Client
+
+The gRPC client provides a wrapper around k6's grpc module with the same ergonomics as HTTP:
+
+```javascript
+import { createGrpcClient } from 'k6-perf-sdk';
+
+// Create gRPC client with proto files
+const grpcClient = createGrpcClient({
+  address: 'localhost:50051',
+  protoFiles: ['user.proto'],
+  protoPaths: ['./protos'],
+  plaintext: true, // or false for TLS
+  defaultMetadata: {
+    'custom-header': 'value'
+  }
+});
+
+// Make a unary call with automatic logging and metrics
+const response = grpcClient.invoke('user.UserService/GetUser', {
+  id: 123
+}, {
+  tags: { name: 'GetUser' },
+  timeout: '30s'
+});
+
+// Make a server streaming call
+const stream = grpcClient.invokeStream('user.UserService/StreamUsers', {
+  filter: 'active'
+}, {
+  tags: { name: 'StreamUsers' }
+});
+
+// Health check
+const health = grpcClient.healthcheck('user.UserService');
+
+// Close connection when done
+grpcClient.close();
+```
+
 ## Advanced Usage
 
 You can import and use individual modules:
@@ -279,6 +320,7 @@ The SDK includes the following utility modules:
 | Module | Description | Key Functions |
 |--------|-------------|---------------|
 | `http.js` | HTTP client wrapper | `request()`, `get()`, `post()`, etc. |
+| `grpc/` | gRPC client wrapper | `invoke()`, `invokeStream()`, `healthcheck()` |
 | `auth.js` | Authentication helpers | `BearerTokenManager`, `OAuthManager` |
 | `helpers.js` | General utilities | `randomString()`, `uuid()`, `sleep()` |
 | `validation.js` | Input validation | `validateConfig()`, `validateResponse()` |
@@ -290,7 +332,9 @@ Thresholds define pass/fail criteria for your tests. The SDK uses the following 
 ```javascript
 thresholds: {
   http_req_duration: ['p(95)<500'], // 95% of requests must complete within 500ms
-  http_req_failed: ['rate<0.01']    // Less than 1% of requests can fail
+  http_req_failed: ['rate<0.01'],   // Less than 1% of requests can fail
+  grpc_req_duration: ['p(95)<500'], // gRPC requests must complete within 500ms
+  grpc_req_failed: ['rate<0.01']    // Less than 1% of gRPC requests can fail
 }
 ```
 
@@ -315,7 +359,14 @@ thresholds: {
 Enable debug logging by setting the `DEBUG` environment variable:
 
 ```bash
+# For general debugging
 k6 run script.js -e DEBUG=true
+
+# For detailed gRPC/HTTP logging
+k6 run script.js -e LOG_LEVEL=DEBUG
+
+# For maximum verbosity
+k6 run script.js -e LOG_LEVEL=TRACE
 ```
 
 ## Contributing
