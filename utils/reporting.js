@@ -1,274 +1,457 @@
+import { htmlReport } from 'https://raw.githubusercontent.com/benc-uk/k6-reporter/main/dist/bundle.js';
+import { textSummary } from 'https://jslib.k6.io/k6-summary/0.0.1/index.js';
+
 /**
- * Reporting Service Output Adapter for k6 performance testing SDK
+ * Generic K6 Test Reporting Utilities
  * 
- * Transforms k6 JSON results into PerfRunDTO format and sends to central Reporting API
- * with exponential back-off retry logic (1s, 2s, 4s, max 3 attempts).
- */
-
-import http from 'k6/http';
-import { sleep } from 'k6';
-
-/**
- * PerfRunDTO structure for reporting
- * @typedef {Object} PerfRunDTO
- * @property {number} vu - Virtual Users (peak concurrent users)
- * @property {number} rps - Requests Per Second (average throughput)  
- * @property {number} passRate - Pass rate percentage (0-100)
- * @property {number} p95 - 95th percentile response time in milliseconds
- * @property {string} testName - Name/identifier of the test
- * @property {string} timestamp - ISO timestamp of test completion
- * @property {string} environment - Test environment (dev, staging, prod)
- * @property {number} duration - Test duration in seconds
- * @property {Object} metadata - Additional test metadata
+ * This module provides reusable functions for generating comprehensive test reports
+ * from K6 test data, including ReportPortal-compatible structured data.
  */
 
 /**
- * ReportingAdapter class for sending k6 results to central reporting API
+ * Default report configuration
  */
-export class ReportingAdapter {
-  /**
-   * Create a reporting adapter
-   * @param {Object} config - Adapter configuration
-   * @param {string} config.apiUrl - Reporting API base URL
-   * @param {string} config.apiKey - API key for authentication
-   * @param {string} [config.environment='test'] - Test environment
-   * @param {number} [config.maxRetries=3] - Maximum retry attempts
-   * @param {Array<number>} [config.retryDelays=[1000, 2000, 4000]] - Retry delays in ms
-   * @param {number} [config.timeout=10000] - Request timeout in ms
-   */
-  constructor(config) {
-    this.apiUrl = config.apiUrl;
-    this.apiKey = config.apiKey;
-    this.environment = config.environment || 'test';
-    this.maxRetries = config.maxRetries || 3;
-    this.retryDelays = config.retryDelays || [1000, 2000, 4000];
-    this.timeout = config.timeout || 10000;
+const DEFAULT_CONFIG = {
+  basePath: '/src/reports/',
+  testName: 'Performance Test',
+  reportDate: null, // Will be auto-generated if null
+  includeRawData: true,
+  includeStructuredData: true,
+  includePerformanceMetrics: true,
+  htmlOptions: {
+    title: 'Performance Test Results',
+    logos: {
+      k6: 'https://avatars.githubusercontent.com/u/11512485',
+    },
+  }
+};
+
+/**
+ * Generate comprehensive test reports from K6 data
+ * @param {Object} data - K6 test results data
+ * @param {Object} config - Report configuration options
+ * @returns {Object} Object containing report files
+ */
+export function generateComprehensiveReports(data, config = {}) {
+  const finalConfig = { ...DEFAULT_CONFIG, ...config };
+  const reportDate = finalConfig.reportDate || new Date().toISOString().split('.')[0].replace(/[:T]/g, '-');
+  
+  // Generate report sections
+  const testOverview = generateTestOverview(data, finalConfig.testName);
+  const iterationMetrics = generateIterationMetrics(data);
+  const testAnalysis = generateTestAnalysis(data);
+  
+  // Combine all sections into comprehensive report
+  const comprehensiveReport = `
+# COMPREHENSIVE TEST REPORT - ${finalConfig.testName}
+Generated: ${new Date().toISOString()}
+
+${testOverview}
+
+${iterationMetrics}
+
+${testAnalysis}
+
+${finalConfig.includeRawData ? `# RAW DATA\n${JSON.stringify(data, null, 2)}` : ''}
+  `;
+  
+  const files = {
+    // HTML Report with charts and detailed metrics
+    [`${finalConfig.basePath}${finalConfig.testName.replace(/\s+/g, '')}_Report_${reportDate}.html`]: htmlReport(data, {
+      title: finalConfig.htmlOptions.title || `${finalConfig.testName} Results`,
+      logos: finalConfig.htmlOptions.logos || {},
+    }),
     
-    if (!this.apiUrl) {
-      throw new Error('Reporting API URL is required');
-    }
-    
-    if (!this.apiKey) {
-      throw new Error('API key is required for reporting');
-    }
+    // Comprehensive text summary
+    [`${finalConfig.basePath}${finalConfig.testName.replace(/\s+/g, '')}_Summary_${reportDate}.txt`]: comprehensiveReport,
+  };
+
+  // Add optional reports based on configuration
+  if (finalConfig.includeRawData) {
+    files[`${finalConfig.basePath}RawK6Data_${reportDate}.json`] = JSON.stringify(data, null, 2);
+  }
+
+  if (finalConfig.includeStructuredData) {
+    const structuredData = generateStructuredTestData(data);
+    files[`${finalConfig.basePath}StructuredTestData_${reportDate}.json`] = JSON.stringify(structuredData, null, 2);
+  }
+
+  if (finalConfig.includePerformanceMetrics) {
+    const performanceMetrics = generatePerformanceMetrics(data);
+    files[`${finalConfig.basePath}PerformanceMetrics_${reportDate}.json`] = JSON.stringify(performanceMetrics, null, 2);
   }
   
-  /**
-   * Transform k6 results JSON to PerfRunDTO format
-   * @param {Object} k6Results - Raw k6 results JSON from handleSummary
-   * @param {Object} testMetadata - Additional test metadata
-   * @returns {PerfRunDTO} Transformed DTO
-   */
-  transformResults(k6Results, testMetadata = {}) {
-    const metrics = k6Results.metrics || {};
-    
-    // Extract core metrics with safe fallbacks
-    const httpReqDuration = metrics.http_req_duration || {};
-    const httpReqFailed = metrics.http_req_failed || {};
-    const httpReqs = metrics.http_reqs || {};
-    const vus = metrics.vus || {};
-    const vusMax = metrics.vus_max || {};
-    
-    // Calculate VU (peak concurrent users)
-    const vu = vusMax.value || vus.max || 0;
-    
-    // Calculate test duration from root state or metrics
-    const testDuration = k6Results.state?.testRunDurationMs 
-      ? k6Results.state.testRunDurationMs / 1000 
-      : httpReqs.rate ? httpReqs.count / httpReqs.rate : 1;
-    
-    // Calculate RPS (requests per second)
-    const totalRequests = httpReqs.count || 0;
-    const rps = httpReqs.rate || (totalRequests / Math.max(testDuration, 1));
-    
-    // Calculate pass rate
-    const failedRequests = httpReqFailed.values?.rate || 0;
-    const failedCount = httpReqFailed.values?.fails || 0;
-    const passRate = totalRequests > 0 
-      ? Math.round(((totalRequests - failedCount) / totalRequests) * 10000) / 100
-      : 100;
-    
-    // Get p95 response time (convert from seconds to milliseconds if needed)
-    let p95 = httpReqDuration.values?.['p(95)'] || httpReqDuration['p(95)'] || 0;
-    // k6 returns duration in milliseconds already for most metrics
-    if (p95 < 10) {
-      // If less than 10, it's likely in seconds, convert to ms
-      p95 = p95 * 1000;
-    }
-    
-    // Build DTO
-    const perfRunDTO = {
-      vu: Math.round(vu),
-      rps: Math.round(rps * 100) / 100, // Round to 2 decimal places
-      passRate: Math.round(passRate * 100) / 100, // Round to 2 decimal places
-      p95: Math.round(p95 * 100) / 100, // Round to 2 decimal places
-      testName: testMetadata.testName || testMetadata.name || 'k6-performance-test',
-      timestamp: new Date().toISOString(),
-      environment: this.environment,
-      duration: Math.round(testDuration),
-      metadata: {
-        totalRequests: Math.round(totalRequests),
-        failedRequests: Math.round(failedCount),
-        avgDuration: Math.round((httpReqDuration.values?.avg || 0) * 100) / 100,
-        testStartTime: k6Results.state?.testStartTimestamp || null,
-        testEndTime: k6Results.state?.testEndTimestamp || null,
-        k6Version: k6Results.root_group?.name || 'unknown',
-        ...testMetadata
-      }
-    };
-    
-    return perfRunDTO;
-  }
+  return files;
+}
+
+/**
+ * Generate comprehensive test overview section
+ * @param {Object} data - K6 test results data
+ * @param {string} testName - Name of the test
+ * @returns {string} Formatted test overview
+ */
+export function generateTestOverview(data, testName = 'Load Test') {
+  const metrics = data.metrics || {};
+  const state = data.state || {};
   
-  /**
-   * Send PerfRunDTO to reporting API with retry logic
-   * @param {PerfRunDTO} perfRunDTO - Performance run data
-   * @returns {Object} API response
-   */
-  sendReport(perfRunDTO) {
-    let lastError = null;
+  // Calculate key metrics
+  const totalDuration = data.state ? (data.state.testRunDurationMs / 1000).toFixed(2) : 'N/A';
+  const totalRequests = metrics.http_reqs ? metrics.http_reqs.values.count : 0;
+  const failedRequests = metrics.http_req_failed ? metrics.http_req_failed.values.count : 0;
+  const successRate = totalRequests > 0 ? ((totalRequests - failedRequests) / totalRequests * 100).toFixed(2) : 'N/A';
+  const avgResponseTime = metrics.http_req_duration ? metrics.http_req_duration.values.avg.toFixed(2) : 'N/A';
+  const throughput = metrics.http_reqs ? metrics.http_reqs.values.rate.toFixed(2) : 'N/A';
+  const maxVUs = metrics.vus_max ? metrics.vus_max.values.max : 'N/A';
+  const totalFailedVUs = metrics.vus ? (metrics.vus.values.max - (metrics.vus.values.max * (1 - (failedRequests / totalRequests)))) : 0;
+  
+  // Calculate data transfer
+  const dataSent = metrics.data_sent ? (metrics.data_sent.values.count / 1024 / 1024).toFixed(2) : 'N/A';
+  const dataReceived = metrics.data_received ? (metrics.data_received.values.count / 1024 / 1024).toFixed(2) : 'N/A';
+  
+  // Check thresholds
+  const thresholds = data.thresholds || {};
+  const thresholdResults = Object.entries(thresholds).map(([name, threshold]) => {
+    const metric = metrics[name];
+    if (!metric) return `- ${name}: No data available`;
     
-    for (let attempt = 0; attempt < this.maxRetries; attempt++) {
-      try {
-        const response = this._makeRequest(perfRunDTO);
-        
-        // Check if request was successful
-        if (response.status === 201) {
-          console.log(`✅ Performance report sent successfully on attempt ${attempt + 1}`);
-          return response;
-        } else if (response.status >= 400 && response.status < 500) {
-          // Client error - don't retry
-          throw new Error(`API returned client error ${response.status}: ${response.body}`);
-        } else {
-          // Server error or other - retry
-          throw new Error(`API returned status ${response.status}: ${response.body}`);
-        }
-        
-      } catch (error) {
-        lastError = error;
-        console.warn(`⚠️  Attempt ${attempt + 1} failed: ${error.message}`);
-        
-        // If this isn't the last attempt, wait before retrying
-        if (attempt < this.maxRetries - 1) {
-          const delay = this.retryDelays[attempt] || this.retryDelays[this.retryDelays.length - 1];
-          console.log(`🔄 Retrying in ${delay}ms...`);
-          sleep(delay / 1000); // k6 sleep expects seconds
+    const passed = threshold.passes > 0;
+    const status = passed ? 'PASSED' : 'FAILED';
+    return `- ${name}: ${status} (${threshold.passes}/${threshold.passes + threshold.fails})`;
+  }).join('\n');
+  
+  return `
+## TEST OVERVIEW - ${testName}
+- **Type**: ${testName}
+- **Duration**: ${totalDuration} seconds
+- **Throughput**: ${throughput} requests/second
+- **Environment**: ${__ENV.BASE_URL || 'Default'}
+- **Total Failed VUs**: ${totalFailedVUs.toFixed(0)}
+- **Success Rate**: ${successRate}%
+- **Average Response Time**: ${avgResponseTime}ms
+- **Checks Passed**: ${(() => {
+    if (!data.root_group) return '0/0';
+    function countChecks(group) {
+      let totalPasses = 0, totalFails = 0;
+      if (group.checks && Array.isArray(group.checks)) {
+        for (const check of group.checks) {
+          totalPasses += check.passes || 0;
+          totalFails += check.fails || 0;
         }
       }
+      if (group.groups && Array.isArray(group.groups)) {
+        for (const nestedGroup of group.groups) {
+          const nested = countChecks(nestedGroup);
+          totalPasses += nested.passes;
+          totalFails += nested.fails;
+        }
+      }
+      return { passes: totalPasses, fails: totalFails };
+    }
+    const counts = countChecks(data.root_group);
+    return `${counts.passes}/${counts.passes + counts.fails}`;
+  })()}
+- **Max VUs**: ${maxVUs}
+- **Data Transfer**: ${dataSent}MB sent, ${dataReceived}MB received
+
+## THRESHOLDS
+${thresholdResults}
+  `;
+}
+
+/**
+ * Generate iteration metrics section
+ * @param {Object} data - K6 test results data
+ * @returns {string} Formatted iteration metrics
+ */
+export function generateIterationMetrics(data) {
+  const metrics = data.metrics || {};
+  
+  return `
+## ITERATION METRICS
+- **Total Iterations**: ${metrics.iterations ? metrics.iterations.values.count : 'N/A'}
+- **Iteration Rate**: ${metrics.iterations ? metrics.iterations.values.rate.toFixed(2) : 'N/A'} iterations/second
+- **Average Iteration Duration**: ${metrics.iteration_duration ? metrics.iteration_duration.values.avg.toFixed(2) : 'N/A'}ms
+- **Min Iteration Duration**: ${metrics.iteration_duration ? metrics.iteration_duration.values.min.toFixed(2) : 'N/A'}ms
+- **Max Iteration Duration**: ${metrics.iteration_duration ? metrics.iteration_duration.values.max.toFixed(2) : 'N/A'}ms
+  `;
+}
+
+/**
+ * Generate detailed test analysis section
+ * @param {Object} data - K6 test results data
+ * @returns {string} Formatted test analysis
+ */
+export function generateTestAnalysis(data) {
+  const metrics = data.metrics || {};
+  const rootGroup = data.root_group || {};
+  
+  // Response time percentiles
+  const responseTimeP95 = metrics.http_req_duration ? metrics.http_req_duration.values['p(95)'].toFixed(2) : 'N/A';
+  const responseTimeP99 = metrics.http_req_duration ? metrics.http_req_duration.values['p(99)'].toFixed(2) : 'N/A';
+  
+  // Detailed check results with proper aggregation
+  const checkResults = (() => {
+    if (!rootGroup) return 'No check data available';
+    
+    function countChecks(group) {
+      let totalPasses = 0, totalFails = 0;
+      if (group.checks && Array.isArray(group.checks)) {
+        for (const check of group.checks) {
+          totalPasses += check.passes || 0;
+          totalFails += check.fails || 0;
+        }
+      }
+      if (group.groups && Array.isArray(group.groups)) {
+        for (const nestedGroup of group.groups) {
+          const nested = countChecks(nestedGroup);
+          totalPasses += nested.passes;
+          totalFails += nested.fails;
+        }
+      }
+      return { passes: totalPasses, fails: totalFails };
     }
     
-    // All attempts failed
-    const errorMsg = `Reporting failed after ${this.maxRetries} attempts. Last error: ${lastError?.message}`;
-    console.error(`❌ ${errorMsg}`);
-    throw new Error(errorMsg);
+    const counts = countChecks(rootGroup);
+    const total = counts.passes + counts.fails;
+    const successRate = total > 0 ? ((counts.passes / total) * 100).toFixed(2) : '0.00';
+    
+    return `
+### Detailed Check Results
+- **Request Success Rate**: ${counts.passes}/${total} (${successRate}%)
+- **Bundle Processing**: ${counts.passes > 0 ? 'PASSED' : 'FAILED'}
+- **Threshold Compliance**: ${Object.values(data.thresholds || {}).every(t => t.passes > 0) ? 'PASSED' : 'FAILED'}
+- **Scaling Behavior**: ${metrics.vus ? 'Analyzed' : 'Not Available'}
+- **Service Invocation**: ${metrics.http_reqs ? 'Successful' : 'Failed'}
+    `;
+  })();
+  
+  return `
+## TEST ANALYSIS
+- **Duration**: ${data.state ? (data.state.testRunDurationMs / 1000).toFixed(2) : 'N/A'} seconds
+- **Response Time P95**: ${responseTimeP95}ms
+- **Response Time P99**: ${responseTimeP99}ms
+- **Total Requests**: ${metrics.http_reqs ? metrics.http_reqs.values.count : 'N/A'}
+- **Failed Requests**: ${metrics.http_req_failed ? metrics.http_req_failed.values.count : 'N/A'}
+- **Request Rate**: ${metrics.http_reqs ? metrics.http_reqs.values.rate.toFixed(2) : 'N/A'} req/s
+
+${checkResults}
+
+### Performance Request Metrics
+- **Min Response Time**: ${metrics.http_req_duration ? metrics.http_req_duration.values.min.toFixed(2) : 'N/A'}ms
+- **Max Response Time**: ${metrics.http_req_duration ? metrics.http_req_duration.values.max.toFixed(2) : 'N/A'}ms
+- **Median Response Time**: ${metrics.http_req_duration ? metrics.http_req_duration.values.med.toFixed(2) : 'N/A'}ms
+- **Average Response Time**: ${metrics.http_req_duration ? metrics.http_req_duration.values.avg.toFixed(2) : 'N/A'}ms
+  `;
+}
+
+/**
+ * Generate structured test data for ReportPortal integration
+ * @param {Object} data - K6 test results data
+ * @returns {Object} Structured data object
+ */
+export function generateStructuredTestData(data) {
+  const metrics = data.metrics || {};
+  
+  // Helper function to recursively count checks from groups
+  function countChecks(group) {
+    let totalPasses = 0;
+    let totalFails = 0;
+    
+    // Count checks in current group
+    if (group.checks && Array.isArray(group.checks)) {
+      for (const check of group.checks) {
+        totalPasses += check.passes || 0;
+        totalFails += check.fails || 0;
+      }
+    }
+    
+    // Recursively count checks in nested groups
+    if (group.groups && Array.isArray(group.groups)) {
+      for (const nestedGroup of group.groups) {
+        const nestedCounts = countChecks(nestedGroup);
+        totalPasses += nestedCounts.passes;
+        totalFails += nestedCounts.fails;
+      }
+    }
+    
+    return { passes: totalPasses, fails: totalFails };
   }
   
-  /**
-   * Make HTTP request to reporting API
-   * @private
-   * @param {PerfRunDTO} perfRunDTO - Performance run data
-   * @returns {Object} HTTP response
-   */
-  _makeRequest(perfRunDTO) {
-    const url = `${this.apiUrl}/api/performance-runs`;
-    const payload = JSON.stringify(perfRunDTO);
-    
-    const params = {
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${this.apiKey}`,
-        'User-Agent': 'k6-reporting-adapter/1.0.0',
-        'Accept': 'application/json'
+  const checkCounts = data.root_group ? countChecks(data.root_group) : { passes: 0, fails: 0 };
+  
+  return {
+    test_duration: data.state ? (data.state.testRunDurationMs / 1000) : 0,
+    metrics: {
+      iterations: {
+        count: metrics.iterations ? metrics.iterations.values.count : 0,
+        rate: metrics.iterations ? metrics.iterations.values.rate : 0,
       },
-      timeout: `${this.timeout}ms`,
-      tags: {
-        name: 'reporting-api-request',
-        endpoint: '/api/performance-runs',
-        attempt: 'true'
-      }
-    };
-    
-    return http.post(url, payload, params);
-  }
-  
-  /**
-   * Send k6 results directly (convenience method)
-   * @param {Object} k6Results - Raw k6 results JSON
-   * @param {Object} testMetadata - Additional test metadata
-   * @returns {Object} API response
-   */
-  reportResults(k6Results, testMetadata = {}) {
-    const perfRunDTO = this.transformResults(k6Results, testMetadata);
-    return this.sendReport(perfRunDTO);
-  }
-}
-
-/**
- * Create a reporting adapter with configuration
- * @param {Object} config - Adapter configuration
- * @returns {ReportingAdapter} Configured adapter instance
- */
-export function createReportingAdapter(config) {
-  return new ReportingAdapter(config);
-}
-
-/**
- * Quick report function for immediate use
- * @param {Object} k6Results - Raw k6 results JSON
- * @param {Object} config - Adapter configuration
- * @param {Object} testMetadata - Additional test metadata
- * @returns {Object} API response
- */
-export function reportPerformanceResults(k6Results, config, testMetadata = {}) {
-  const adapter = new ReportingAdapter(config);
-  return adapter.reportResults(k6Results, testMetadata);
-}
-
-/**
- * Enhanced handleSummary function that sends reports to API
- * @param {Object} data - k6 test results
- * @param {Object} config - Reporting configuration
- * @param {Object} testMetadata - Test metadata
- * @param {Function} [originalHandler] - Original handleSummary function
- * @returns {Object} Summary output (HTML reports, etc.)
- */
-export function createReportingHandleSummary(config, testMetadata = {}, originalHandler = null) {
-  return function handleSummary(data) {
-    let results = {};
-    
-    // Call original handler if provided
-    if (originalHandler && typeof originalHandler === 'function') {
-      results = originalHandler(data) || {};
-    }
-    
-    // Send to reporting API if configured
-    if (config.apiUrl && config.apiKey) {
-      try {
-        console.log('📊 Sending performance report to central API...');
-        
-        const adapter = new ReportingAdapter(config);
-        const response = adapter.reportResults(data, testMetadata);
-        
-        if (response.status === 201) {
-          console.log('✅ Performance report sent successfully!');
-          console.log('📊 Dashboard should display new PerfRun row within 10 seconds');
-        }
-        
-        // Add the JSON payload to results for debugging
-        const perfRunDTO = adapter.transformResults(data, testMetadata);
-        results['reports/perf-run-data.json'] = JSON.stringify(perfRunDTO, null, 2);
-        
-      } catch (error) {
-        console.error('❌ Failed to send performance report:', error.message);
-        // Don't fail the test if reporting fails
-      }
-    } else {
-      console.warn('⚠️  Reporting disabled: apiUrl and apiKey must be configured');
-    }
-    
-    return results;
+      checks: {
+        passes: checkCounts.passes,
+        fails: checkCounts.fails,
+      },
+      iteration_duration: {
+        avg: metrics.iteration_duration ? metrics.iteration_duration.values.avg : 0,
+        min: metrics.iteration_duration ? metrics.iteration_duration.values.min : 0,
+        max: metrics.iteration_duration ? metrics.iteration_duration.values.max : 0,
+        med: metrics.iteration_duration ? metrics.iteration_duration.values.med : 0,
+        'p(95)': metrics.iteration_duration ? metrics.iteration_duration.values['p(95)'] : 0,
+        'p(99)': metrics.iteration_duration ? metrics.iteration_duration.values['p(99)'] : 0,
+      },
+      http_req_duration: {
+        avg: metrics.http_req_duration ? metrics.http_req_duration.values.avg : 0,
+        min: metrics.http_req_duration ? metrics.http_req_duration.values.min : 0,
+        max: metrics.http_req_duration ? metrics.http_req_duration.values.max : 0,
+        med: metrics.http_req_duration ? metrics.http_req_duration.values.med : 0,
+        'p(95)': metrics.http_req_duration ? metrics.http_req_duration.values['p(95)'] : 0,
+        'p(99)': metrics.http_req_duration ? metrics.http_req_duration.values['p(99)'] : 0,
+      },
+      vus: {
+        value: metrics.vus ? metrics.vus.values.value : 0,
+      },
+      vus_max: {
+        max: metrics.vus_max ? metrics.vus_max.values.max : 0,
+      },
+      data_sent: {
+        count: metrics.data_sent ? metrics.data_sent.values.count : 0,
+      },
+      data_received: {
+        count: metrics.data_received ? metrics.data_received.values.count : 0,
+      },
+      http_reqs: {
+        count: metrics.http_reqs ? metrics.http_reqs.values.count : 0,
+        rate: metrics.http_reqs ? metrics.http_reqs.values.rate : 0,
+      },
+      http_req_failed: {
+        count: metrics.http_req_failed ? metrics.http_req_failed.values.count : 0,
+        rate: metrics.http_req_failed ? metrics.http_req_failed.values.rate : 0,
+      },
+    },
+    thresholds: data.thresholds || {},
+    root_group: data.root_group || {},
   };
 }
 
-// Export default
-export default ReportingAdapter; 
+/**
+ * Generate performance metrics summary
+ * @param {Object} data - K6 test results data
+ * @returns {Object} Performance metrics object
+ */
+export function generatePerformanceMetrics(data) {
+  const metrics = data.metrics || {};
+  
+  return {
+    summary: {
+      test_duration_seconds: data.state ? (data.state.testRunDurationMs / 1000) : 0,
+      total_requests: metrics.http_reqs ? metrics.http_reqs.values.count : 0,
+      failed_requests: metrics.http_req_failed ? metrics.http_req_failed.values.count : 0,
+      success_rate: metrics.http_req_failed ? (1 - metrics.http_req_failed.values.rate) * 100 : 0,
+      requests_per_second: metrics.http_reqs ? metrics.http_reqs.values.rate : 0,
+      avg_response_time_ms: metrics.http_req_duration ? metrics.http_req_duration.values.avg : 0,
+      p95_response_time_ms: metrics.http_req_duration ? metrics.http_req_duration.values['p(95)'] : 0,
+      p99_response_time_ms: metrics.http_req_duration ? metrics.http_req_duration.values['p(99)'] : 0,
+    },
+    response_times: {
+      min: metrics.http_req_duration ? metrics.http_req_duration.values.min : 0,
+      max: metrics.http_req_duration ? metrics.http_req_duration.values.max : 0,
+      avg: metrics.http_req_duration ? metrics.http_req_duration.values.avg : 0,
+      med: metrics.http_req_duration ? metrics.http_req_duration.values.med : 0,
+      p90: metrics.http_req_duration ? metrics.http_req_duration.values['p(90)'] : 0,
+      p95: metrics.http_req_duration ? metrics.http_req_duration.values['p(95)'] : 0,
+      p99: metrics.http_req_duration ? metrics.http_req_duration.values['p(99)'] : 0,
+    },
+    data_transfer: {
+      bytes_sent: metrics.data_sent ? metrics.data_sent.values.count : 0,
+      bytes_received: metrics.data_received ? metrics.data_received.values.count : 0,
+      transfer_rate_bps: {
+        sent: metrics.data_sent ? metrics.data_sent.values.rate : 0,
+        received: metrics.data_received ? metrics.data_received.values.rate : 0,
+      }
+    },
+    virtual_users: {
+      current: metrics.vus ? metrics.vus.values.value : 0,
+      max: metrics.vus_max ? metrics.vus_max.values.max : 0,
+    },
+    iterations: {
+      total: metrics.iterations ? metrics.iterations.values.count : 0,
+      rate: metrics.iterations ? metrics.iterations.values.rate : 0,
+      avg_duration_ms: metrics.iteration_duration ? metrics.iteration_duration.values.avg : 0,
+    },
+    thresholds_passed: data.thresholds ? Object.values(data.thresholds).every(t => t.passes > 0) : false,
+    checks_passed: (() => {
+      if (!data.root_group) return 0;
+      function countChecks(group) {
+        let totalPasses = 0, totalFails = 0;
+        if (group.checks && Array.isArray(group.checks)) {
+          for (const check of group.checks) {
+            totalPasses += check.passes || 0;
+            totalFails += check.fails || 0;
+          }
+        }
+        if (group.groups && Array.isArray(group.groups)) {
+          for (const nestedGroup of group.groups) {
+            const nested = countChecks(nestedGroup);
+            totalPasses += nested.passes;
+            totalFails += nested.fails;
+          }
+        }
+        return { passes: totalPasses, fails: totalFails };
+      }
+      return countChecks(data.root_group).passes;
+    })(),
+    checks_failed: (() => {
+      if (!data.root_group) return 0;
+      function countChecks(group) {
+        let totalPasses = 0, totalFails = 0;
+        if (group.checks && Array.isArray(group.checks)) {
+          for (const check of group.checks) {
+            totalPasses += check.passes || 0;
+            totalFails += check.fails || 0;
+          }
+        }
+        if (group.groups && Array.isArray(group.groups)) {
+          for (const nestedGroup of group.groups) {
+            const nested = countChecks(nestedGroup);
+            totalPasses += nested.passes;
+            totalFails += nested.fails;
+          }
+        }
+        return { passes: totalPasses, fails: totalFails };
+      }
+      return countChecks(data.root_group).fails;
+    })(),
+  };
+}
+
+/**
+ * Simple report generation for basic use cases
+ * @param {Object} data - K6 test results data
+ * @param {string} testName - Name of the test
+ * @returns {Object} Basic report files
+ */
+export function generateBasicReports(data, testName = 'Performance Test') {
+  return generateComprehensiveReports(data, {
+    testName,
+    includeRawData: false,
+    includeStructuredData: false,
+    includePerformanceMetrics: false,
+  });
+}
+
+/**
+ * ReportPortal-focused report generation
+ * @param {Object} data - K6 test results data
+ * @param {string} testName - Name of the test
+ * @returns {Object} ReportPortal-compatible report files
+ */
+export function generateReportPortalReports(data, testName = 'Performance Test') {
+  return generateComprehensiveReports(data, {
+    testName,
+    includeRawData: false,
+    includeStructuredData: true,
+    includePerformanceMetrics: true,
+    htmlOptions: {
+      title: `${testName} - ReportPortal Integration`,
+    }
+  });
+}
