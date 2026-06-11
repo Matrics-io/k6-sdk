@@ -17,7 +17,6 @@ import { createGrpcClient } from './gRPC/client.js';
 import { BasicAuthManager, BearerTokenManager, ApiKeyManager, OAuth2Manager } from './utils/auth.js';
 import { ReportingAdapter, createReportingAdapter, reportPerformanceResults, createReportingHandleSummary } from './utils/reporting.js';
 import * as helpers from './utils/helpers.js';
-
 /**
  * Create a k6 test configuration
  * @param {Object} config - Test configuration
@@ -97,5 +96,5 @@ export {
   
   
   // Helper utilities
-  helpers
+  helpers,
 };
