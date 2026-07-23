@@ -1,0 +1,331 @@
+#!/bin/bash
+set -euo pipefail
+
+# Absolute path to this wrapper, captured before any `cd` so the `rerun`
+# subcommand can re-exec it from the original test's working directory.
+K6W_SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+# Resolve the k6 binary to run. This lets the wrapper live in a different location
+# from the binary (e.g. k6w installed via an SDK, custom binary installed on the
+# host). Resolution order, first match wins:
+#   1. K6W_K6_BIN — explicit override (most robust for CI/remote runs)
+#   2. a `k6` sitting next to this wrapper — resolves against the wrapper's own
+#      directory, not the CWD, so it survives `cd` into a test directory
+#   3. `k6` found on PATH (e.g. `xk6 build` installed to /usr/local/bin)
+#   4. legacy `./k6` relative to the current working directory
+_resolve_k6_bin() {
+  if [[ -n "${K6W_K6_BIN:-}" ]]; then
+    if [[ ! -x "${K6W_K6_BIN}" ]]; then
+      echo "[k6w] Error: K6W_K6_BIN=${K6W_K6_BIN} is not an executable file" >&2
+      exit 1
+    fi
+    printf '%s' "${K6W_K6_BIN}"
+    return
+  fi
+  local self_dir; self_dir="$(dirname "${K6W_SELF}")"
+  if [[ -x "${self_dir}/k6" ]]; then
+    printf '%s' "${self_dir}/k6"
+    return
+  fi
+  if command -v k6 > /dev/null 2>&1; then
+    command -v k6
+    return
+  fi
+  printf '%s' "./k6"
+}
+K6_BIN="$(_resolve_k6_bin)"
+
+# Warn (don't fail) if the resolved binary doesn't advertise the clickhouse output
+# extension — a stock k6 picked up off PATH will run fine but silently stream no
+# metrics to ClickHouse, so the run would never appear in the dashboard.
+_check_k6_clickhouse() {
+  local ver
+  ver="$("${K6_BIN}" version 2>/dev/null)" || {
+    echo "[k6w] Warning: could not run '${K6_BIN} version' to verify the k6 binary" >&2
+    return
+  }
+  if ! printf '%s' "${ver}" | grep -qi 'clickhouse'; then
+    echo "[k6w] Warning: resolved k6 binary '${K6_BIN}' has no clickhouse extension" >&2
+    echo "[k6w]          metrics will NOT reach ClickHouse and the run won't show in the dashboard." >&2
+    echo "[k6w]          Point K6W_K6_BIN at the xk6-clickhouse build of k6." >&2
+  fi
+}
+_check_k6_clickhouse
+
+INSIGHTEST_API_URL="${INSIGHTEST_API_URL:-http://localhost:4000}"
+
+# Ingest API key (X-API-Key). The Insightest ingest endpoints (register, container
+# stats, complete) are write endpoints and require this key on a real deployment.
+# When unset the calls go out without the header — fine for a local API that also
+# has no key configured, rejected (401) by one that does.
+API_KEY_HEADER=()
+if [[ -n "${INSIGHTEST_INGEST_API_KEY:-}" ]]; then
+  API_KEY_HEADER=(-H "X-API-Key: ${INSIGHTEST_INGEST_API_KEY}")
+fi
+
+# Docker socket used to sample container stats locally. k6w runs on the host where
+# the target containers live, so it reads the daemon here and forwards samples to
+# the API — the API never needs Docker access. Override if the socket lives
+# elsewhere (e.g. /run/docker.sock or a rootless path).
+K6W_DOCKER_SOCKET="${K6W_DOCKER_SOCKET:-/var/run/docker.sock}"
+# Seconds between container-stats samples (matches the default k6 clickhouse push interval).
+K6W_STATS_INTERVAL="${K6W_STATS_INTERVAL:-2}"
+
+# Soft-fail curl wrapper: skips the call entirely when curl is not installed.
+_try_curl() {
+  if ! command -v curl > /dev/null 2>&1; then
+    echo "[k6w] Warning: curl not available — skipping HTTP call"
+    return 0
+  fi
+  curl "$@"
+}
+
+# Sample Docker stats for one container and post each sample to Insightest until
+# killed. Runs in the background for the life of the k6 run. Uses the daemon's
+# one-shot stats (stream=false), which already populates precpu_stats so the API
+# can compute CPU% from a single sample. Best-effort: transient failures are
+# swallowed so a hiccup never kills the collector.
+_sample_container_stats() {
+  local container="$1"
+  local stats
+  while true; do
+    if stats=$(curl -sf --unix-socket "${K6W_DOCKER_SOCKET}" \
+        "http://localhost/containers/${container}/stats?stream=false" 2>/dev/null); then
+      curl -sf -X POST "${INSIGHTEST_API_URL}/api/k6/runs/${RUN_ID}/container-stats" \
+        "${API_KEY_HEADER[@]}" -H "Content-Type: application/json" \
+        -d "{\"container_name\":\"${container}\",\"docker_stats\":${stats}}" > /dev/null 2>&1 || true
+    fi
+    sleep "${K6W_STATS_INTERVAL}"
+  done
+}
+
+# Re-run a previous test on THIS host (the one that originally ran it). Asks the
+# API to mint a new run id under the same project, restores the stored command/env,
+# and re-execs `k6w run …` with K6W_RUN_ID set so the normal run path (container
+# stats + /complete) takes over. Execution and metric collection stay local, which
+# is what makes rerun work once the API is deployed away from the load host.
+_do_rerun() {
+  local run_id="$1"
+  if [[ -z "${run_id}" ]]; then
+    echo "[k6w] Usage: k6w rerun <run_id>" >&2
+    exit 1
+  fi
+  command -v curl > /dev/null 2>&1 || { echo "[k6w] Error: rerun requires curl" >&2; exit 1; }
+  command -v jq   > /dev/null 2>&1 || { echo "[k6w] Error: rerun requires jq" >&2; exit 1; }
+
+  local resp
+  resp=$(curl -sf -X POST "${INSIGHTEST_API_URL}/api/k6/runs/${run_id}/prepare-rerun" \
+    "${API_KEY_HEADER[@]}" -H "Content-Type: application/json") || {
+    echo "[k6w] Error: prepare-rerun failed for ${run_id} — check INSIGHTEST_API_URL, INSIGHTEST_INGEST_API_KEY, and that the run exists" >&2
+    exit 1
+  }
+
+  local new_run_id command work_dir
+  new_run_id=$(printf '%s' "${resp}" | jq -r '.run_id // empty')
+  command=$(printf '%s' "${resp}" | jq -r '.command // empty')
+  work_dir=$(printf '%s' "${resp}" | jq -r '.env_vars._work_dir // empty')
+  if [[ -z "${new_run_id}" || -z "${command}" ]]; then
+    echo "[k6w] Error: prepare-rerun response missing run_id or command" >&2
+    exit 1
+  fi
+
+  # Restore the original test's stored env: skip the internal _work_dir key and any
+  # masked secret (***). Connection/secret values (ClickHouse creds, ingest key) are
+  # not stored server-side, so they come from the current shell env instead.
+  while IFS=$'\t' read -r _k _v; do
+    [[ -z "${_k}" ]] && continue
+    export "${_k}=${_v}"
+  done < <(printf '%s' "${resp}" | jq -r '.env_vars // {} | to_entries[] | select(.key != "_work_dir" and .value != "***") | "\(.key)\t\(.value)"')
+
+  export K6W_RUN_ID="${new_run_id}"
+
+  # Re-run from the original working directory so the (relative) script path in the
+  # stored command resolves; warn and stay put if it's gone.
+  if [[ -n "${work_dir}" && -d "${work_dir}" ]]; then
+    cd "${work_dir}" || echo "[k6w] Warning: could not cd to ${work_dir}; running from $(pwd)" >&2
+  elif [[ -n "${work_dir}" ]]; then
+    echo "[k6w] Warning: stored work_dir ${work_dir} not found; running from $(pwd)" >&2
+  fi
+
+  echo "[k6w] Re-running ${run_id} as new run ${new_run_id}"
+  # `command` begins with the literal `run …`; intentional word-split to replay the
+  # original arguments (matches the server-side rerun's strings.Fields behaviour).
+  # shellcheck disable=SC2086
+  exec "${K6W_SELF}" ${command}
+}
+
+# ── Subcommand dispatch ───────────────────────────────────────────────────────
+# `rerun` re-runs a prior test locally; only `run` is instrumented; anything else
+# passes straight through to the real k6 binary.
+if [[ "${1:-}" == "rerun" ]]; then
+  _do_rerun "${2:-}"   # execs `k6w run …`; never returns
+fi
+if [[ "${1:-}" != "run" ]]; then
+  exec "${K6_BIN}" "$@"
+fi
+
+# If K6W_RUN_ID is set, a run_id was pre-assigned by the API (rerun path) — skip UUID generation and registration
+if [[ -n "${K6W_RUN_ID:-}" ]]; then
+  RUN_ID="${K6W_RUN_ID}"
+else
+  if command -v uuidgen > /dev/null 2>&1; then
+    RUN_ID=$(uuidgen)
+  elif [[ -r /proc/sys/kernel/random/uuid ]]; then
+    RUN_ID=$(cat /proc/sys/kernel/random/uuid)
+  else
+    echo "[k6w] Error: cannot generate UUID (uuidgen unavailable and /proc/sys/kernel/random/uuid not readable)" >&2
+    exit 1
+  fi
+
+  # Build a JSON-safe command string (escape backslash and double-quote)
+  COMMAND_STR=$(printf '%s ' "$@" | sed 's/\\/\\\\/g; s/"/\\"/g')
+
+  # Collect test-specific env vars as a JSON object.
+  # K6_CLICKHOUSE_* are excluded — the server already has them via CLICKHOUSE_* in its own env.
+  # Values containing PASSWORD or SECRET are masked.
+  _build_env_json() {
+    local json="{" sep=""
+    while IFS= read -r line; do
+      local key="${line%%=*}"
+      local val="${line#*=}"
+      [[ "$key" =~ ^K6_CLICKHOUSE_(ADDR|USER|PASSWORD|DB)$ ]] && continue
+      [[ "$key" == "K6W_RUN_ID" ]] && continue
+      [[ "$key" =~ ^K6_ || "$key" =~ ^K6W_ || "$key" == "HTTP_HOST" || "$key" == "INSIGHTEST_API_URL" ]] || continue
+      [[ "$key" =~ PASSWORD|SECRET ]] && val="***"
+      val="${val//\\/\\\\}"; val="${val//\"/\\\"}"
+      json+="${sep}\"${key}\":\"${val}\""
+      sep=","
+    done < <(printenv | sort)
+    printf '%s}' "$json"
+  }
+  ENV_JSON=$(_build_env_json)
+
+  # Extract per-scenario config via `k6 inspect` so the dashboard shows real scenario data.
+  # Requires jq; falls back to [] silently when either k6 inspect or jq is unavailable.
+  _get_scenarios_json() {
+    local script_file=""
+    for arg in "$@"; do
+      if [[ "${arg}" == *.js ]]; then
+        script_file="${arg}"
+        break
+      fi
+    done
+    [[ -z "${script_file}" ]] && echo "[]" && return
+    command -v jq > /dev/null 2>&1 || { echo "[]"; return; }
+    local inspect_out
+    inspect_out=$("${K6_BIN}" inspect "${script_file}" 2>/dev/null) || { echo "[]"; return; }
+    printf '%s' "${inspect_out}" | jq -c '[
+      .options.scenarios // {} | to_entries[] | {
+        name: .key,
+        executor: (.value.executor // ""),
+        vus: (.value.vus // 0),
+        duration: (.value.duration // ""),
+        status: "running",
+        progress: 0
+      }
+    ]' 2>/dev/null || echo "[]"
+  }
+  SCENARIOS_JSON=$(_get_scenarios_json "$@")
+
+  # Select the target project via INSIGHTEST_PROJECT, either "name" or the fully
+  # qualified "organization/name" (use the latter when the same project name exists
+  # in more than one org). When unset, the server falls back to its configured
+  # K6_SYNC_PROJECT_ID. The field is omitted entirely when unset so old servers keep working.
+  PROJECT_FIELD=""
+  if [[ -n "${INSIGHTEST_PROJECT:-}" ]]; then
+    _project="${INSIGHTEST_PROJECT//\\/\\\\}"; _project="${_project//\"/\\\"}"
+    PROJECT_FIELD="\"project\":\"${_project}\","
+  fi
+
+  # Register run with Insightest before k6 starts. Soft-fail: never aborts the k6 run.
+  # We capture the HTTP status (instead of curl -f swallowing it) so a rejected
+  # registration — wrong ingest key (401) or unknown project (400/404) — produces a
+  # loud, actionable banner. Those runs still stream metrics to ClickHouse, but with
+  # no registered row they never surface in the dashboard, so silence would hide a
+  # misconfiguration. A connectivity failure (status 000) stays a quiet warning.
+  WORK_DIR=$(pwd)
+  _register_run() {
+    command -v curl > /dev/null 2>&1 || {
+      echo "[k6w] Warning: curl not available — skipping Insightest registration"
+      return 0
+    }
+    local body_file status
+    body_file="$(mktemp 2>/dev/null || echo /tmp/k6w_register_$$)"
+    status=$(curl -s -o "${body_file}" -w '%{http_code}' \
+      -X POST "${INSIGHTEST_API_URL}/api/k6/runs/register" \
+      "${API_KEY_HEADER[@]}" \
+      -H "Content-Type: application/json" \
+      -d "{${PROJECT_FIELD}\"run_id\":\"${RUN_ID}\",\"command\":\"${COMMAND_STR}\",\"work_dir\":\"${WORK_DIR}\",\"env_vars\":${ENV_JSON},\"scenarios\":${SCENARIOS_JSON}}" \
+      2>/dev/null) || status="000"
+
+    if [[ "${status}" =~ ^2 ]]; then
+      rm -f "${body_file}" 2>/dev/null || true
+      return 0
+    fi
+
+    if [[ "${status}" == "000" ]]; then
+      echo "[k6w] Warning: could not reach Insightest at ${INSIGHTEST_API_URL} to register the run — continuing anyway" >&2
+    else
+      local body; body="$(cat "${body_file}" 2>/dev/null)"
+      echo "[k6w] ============================================================" >&2
+      echo "[k6w] WARNING: run registration was REJECTED (HTTP ${status})." >&2
+      echo "[k6w]          ${body}" >&2
+      echo "[k6w]          This run will NOT appear in Insightest. Metrics still" >&2
+      echo "[k6w]          stream to ClickHouse, but with no registered run there is" >&2
+      echo "[k6w]          nothing for the dashboard to attach them to." >&2
+      echo "[k6w]          Check INSIGHTEST_INGEST_API_KEY and INSIGHTEST_PROJECT" >&2
+      echo "[k6w]          (the org/project must already exist in Insightest)." >&2
+      echo "[k6w] ============================================================" >&2
+    fi
+    rm -f "${body_file}" 2>/dev/null || true
+  }
+  _register_run
+fi
+
+# Start container stats collection for each container in K6W_CONTAINER.
+# K6W_CONTAINER is a comma-separated list (a single name still works). Each
+# container gets a background loop that samples the local Docker socket and posts
+# samples to the API. Collection is best-effort: missing curl or docker socket
+# skips it entirely and never aborts the k6 run.
+_STATS_PIDS=()
+if [[ -n "${K6W_CONTAINER:-}" ]]; then
+  if ! command -v curl > /dev/null 2>&1; then
+    echo "[k6w] Warning: curl not available — skipping container stats"
+  elif [[ ! -S "${K6W_DOCKER_SOCKET}" ]]; then
+    echo "[k6w] Warning: docker socket ${K6W_DOCKER_SOCKET} not found — skipping container stats"
+  else
+    IFS=',' read -ra _K6W_CONTAINERS <<< "${K6W_CONTAINER}"
+    for _container in "${_K6W_CONTAINERS[@]}"; do
+      _container="${_container#"${_container%%[![:space:]]*}"}"  # trim leading whitespace
+      _container="${_container%"${_container##*[![:space:]]}"}"  # trim trailing whitespace
+      [[ -z "${_container}" ]] && continue
+      _sample_container_stats "${_container}" &
+      _STATS_PIDS+=("$!")
+    done
+  fi
+fi
+
+# Delegate to the real k6 binary; k6w stays alive as supervisor and forwards k6's exit code.
+# Capture the code with `|| K6_EXIT=$?` so `set -e` does NOT abort the wrapper when k6 exits
+# non-zero (e.g. a script that fails to start) — otherwise the /complete callback below would
+# never fire and the run would be stuck "running" forever.
+K6_EXIT=0
+"${K6_BIN}" "$@" --tag run_id="${RUN_ID}" || K6_EXIT=$?
+
+# Stop container stats collection: kill each background sampler and reap it.
+if [[ ${#_STATS_PIDS[@]} -gt 0 ]]; then
+  for _pid in "${_STATS_PIDS[@]}"; do
+    kill "${_pid}" 2>/dev/null || true
+  done
+  wait "${_STATS_PIDS[@]}" 2>/dev/null || true
+fi
+
+# Report completion so the API finalizes the run promptly (soft-fail: if this never
+# lands, the run stays "running" and the backstop sync finalizes it later).
+_try_curl -sf -X POST "${INSIGHTEST_API_URL}/api/k6/runs/${RUN_ID}/complete" \
+  "${API_KEY_HEADER[@]}" \
+  -H "Content-Type: application/json" \
+  -d "{\"exit_code\":${K6_EXIT}}" \
+  || echo "[k6w] Warning: completion report failed — backstop sync will finalize"
+
+exit $K6_EXIT
