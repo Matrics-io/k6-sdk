@@ -11,8 +11,11 @@ K6W_SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 #   1. K6W_K6_BIN — explicit override (most robust for CI/remote runs)
 #   2. a `k6` sitting next to this wrapper — resolves against the wrapper's own
 #      directory, not the CWD, so it survives `cd` into a test directory
-#   3. `k6` found on PATH (e.g. `xk6 build` installed to /usr/local/bin)
-#   4. legacy `./k6` relative to the current working directory
+#   3. a `k6` next to the wrapper's symlink target — when installed as an npm
+#      dependency the wrapper is invoked through node_modules/.bin/k6w, so a k6
+#      shipped inside the package itself is only visible through the real path
+#   4. `k6` found on PATH (e.g. `xk6 build` installed to /usr/local/bin)
+#   5. legacy `./k6` relative to the current working directory
 _resolve_k6_bin() {
   if [[ -n "${K6W_K6_BIN:-}" ]]; then
     if [[ ! -x "${K6W_K6_BIN}" ]]; then
@@ -26,6 +29,13 @@ _resolve_k6_bin() {
   if [[ -x "${self_dir}/k6" ]]; then
     printf '%s' "${self_dir}/k6"
     return
+  fi
+  if [[ -L "${K6W_SELF}" ]] && command -v readlink > /dev/null 2>&1; then
+    local real_dir; real_dir="$(dirname "$(readlink -f "${K6W_SELF}" 2>/dev/null)")"
+    if [[ -n "${real_dir}" && -x "${real_dir}/k6" ]]; then
+      printf '%s' "${real_dir}/k6"
+      return
+    fi
   fi
   if command -v k6 > /dev/null 2>&1; then
     command -v k6

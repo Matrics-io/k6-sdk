@@ -1,0 +1,29 @@
+{
+  "name": "k6-perf-sdk",
+  "version": "1.1.3",
+  "description": "Modular k6 performance-testing SDK (templates, HTTP/gRPC clients, auth, config) plus the k6w wrapper that registers runs with Insightest.",
+  "main": "index.js",
+  "bin": {
+    "k6w": "bin/k6w"
+  },
+  "files": [
+    "index.js",
+    "bin/k6w",
+    "auth/",
+    "config/",
+    "gRPC/",
+    "http/",
+    "templates/",
+    "utils/",
+    "README.md",
+    "!**/__mocks__/**",
+    "!**/*.test.js"
+  ],
+  "keywords": [
+    "k6",
+    "performance",
+    "load-testing",
+    "insightest"
+  ],
+  "license": "MIT"
+}

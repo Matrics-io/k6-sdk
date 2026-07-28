@@ -1,6 +1,6 @@
 # k6 Performance Testing SDK
 
-[![version](https://img.shields.io/badge/version-1.1.2-blue.svg)](https://github.com/your-org/k6-perf-sdk/releases)
+[![version](https://img.shields.io/badge/version-1.1.3-blue.svg)](https://github.com/your-org/k6-perf-sdk/releases)
 
 A modular and reusable SDK for creating performance tests with k6. This SDK provides common test templates, configuration management, authentication helpers, HTTP and gRPC client utilities to streamline performance testing across multiple projects.
 
@@ -23,6 +23,52 @@ npm install k6-perf-sdk --save-dev
 # If using yarn
 yarn add k6-perf-sdk --dev
 ```
+
+Not published to a registry yet? Install straight from a checkout or a tarball —
+both give you the same `k6w` binary described below:
+
+```bash
+# from a local checkout of platform-tests
+npm install --save-dev /path/to/platform-tests/SDKs/k6
+
+# or from a packed tarball (run `npm pack` inside SDKs/k6 to produce it)
+npm install --save-dev ./k6-perf-sdk-1.1.2.tgz
+```
+
+## The `k6w` wrapper
+
+The SDK ships `bin/k6w`, a drop-in replacement for the `k6` command that registers
+each run with Insightest, streams container stats, and reports completion. Because
+it is declared in the package's `bin` field, installing the SDK puts it on your
+project's PATH at `node_modules/.bin/k6w` — no copying the script into your repo.
+
+```bash
+# run it directly
+npx k6w run tests/load-test.js
+
+# or wire it into package.json scripts, where node_modules/.bin is already on PATH
+#   "scripts": { "perf": "k6w run tests/load-test.js" }
+npm run perf
+```
+
+Anything that is not `run` (or the `rerun <run_id>` subcommand) is passed straight
+through to the real k6 binary, so `k6w inspect …`, `k6w version`, etc. behave as usual.
+
+`k6w` needs a k6 binary to delegate to — ideally the `xk6-clickhouse` build, or
+metrics never reach the dashboard. It looks for one in this order: `K6W_K6_BIN`, a
+`k6` next to the wrapper (including `node_modules/.bin/k6`), `k6` on PATH, then
+`./k6`. On CI the explicit override is the most predictable:
+
+```bash
+export K6W_K6_BIN=/usr/local/bin/k6
+export INSIGHTEST_API_URL=https://insightest.example.com
+export INSIGHTEST_INGEST_API_KEY=…        # required by any deployment with a key configured
+export INSIGHTEST_PROJECT=my-org/my-project
+npx k6w run tests/load-test.js
+```
+
+Other useful variables: `K6W_CONTAINER` (comma-separated container names to sample
+Docker stats for), `K6W_DOCKER_SOCKET`, `K6W_STATS_INTERVAL`.
 
 ## Quick Start
 
