@@ -15,7 +15,12 @@ import createSoakTest from './templates/soak.js';
 import { HttpClient } from './utils/http.js';
 import { createGrpcClient } from './gRPC/client.js';
 import { BasicAuthManager, BearerTokenManager, ApiKeyManager, OAuth2Manager } from './utils/auth.js';
-import { ReportingAdapter, createReportingAdapter, reportPerformanceResults, createReportingHandleSummary } from './utils/reporting.js';
+import {
+  generateComprehensiveReports,
+  generateBasicReports,
+  generateReportPortalReports,
+  generatePerformanceMetrics,
+} from './utils/reporting.js';
 import * as helpers from './utils/helpers.js';
 /**
  * Create a k6 test configuration
@@ -89,12 +94,12 @@ export {
   ApiKeyManager,
   OAuth2Manager,
 
-  ReportingAdapter,
-  createReportingAdapter,
-  reportPerformanceResults,
-  createReportingHandleSummary,
-  
-  
+  // Reporting utilities
+  generateComprehensiveReports,
+  generateBasicReports,
+  generateReportPortalReports,
+  generatePerformanceMetrics,
+
   // Helper utilities
   helpers,
 };

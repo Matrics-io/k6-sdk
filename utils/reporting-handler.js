@@ -5,7 +5,6 @@
  * imported and used across different k6 tests for consistent reporting.
  */
 
-import { ReportingAdapter } from './reporting.js';
 import { htmlReport } from 'https://raw.githubusercontent.com/benc-uk/k6-reporter/main/dist/bundle.js';
 import { textSummary } from 'https://jslib.k6.io/k6-summary/0.0.1/index.js';
 
@@ -52,40 +51,6 @@ export function createHandleSummary(testMetadata, options = {}) {
     if (options.customHandler && typeof options.customHandler === 'function') {
       const customResults = options.customHandler(data);
       Object.assign(results, customResults);
-    }
-    
-    // Send to reporting API if configured
-    if (__ENV.REPORTING_API_URL && __ENV.REPORTING_API_KEY) {
-      try {
-        console.log('📊 Sending performance report to central API...');
-        
-        const adapter = new ReportingAdapter({
-          apiUrl: __ENV.REPORTING_API_URL,
-          apiKey: __ENV.REPORTING_API_KEY,
-          environment: __ENV.TEST_ENVIRONMENT || 'test',
-          maxRetries: parseInt(__ENV.REPORTING_MAX_RETRIES) || 3,
-          timeout: parseInt(__ENV.REPORTING_TIMEOUT) || 10000
-        });
-        
-        const response = adapter.reportResults(data, testMetadata);
-        
-        if (response.status === 201) {
-          console.log('✅ Performance report sent successfully!');
-          console.log('📊 Dashboard should display new PerfRun row within 10 seconds');
-        }
-        
-        // Save debug file with API data
-        if (options.generateFiles) {
-          const perfRunDTO = adapter.transformResults(data, testMetadata);
-          results['reports/perf-run-data.json'] = JSON.stringify(perfRunDTO, null, 2);
-        }
-        
-      } catch (error) {
-        console.error('❌ Failed to send performance report:', error.message);
-        // Don't fail the test if reporting fails
-      }
-    } else {
-      console.warn('⚠️  Reporting disabled: REPORTING_API_URL and REPORTING_API_KEY must be set');
     }
     
     return results;
