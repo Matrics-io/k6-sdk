@@ -61,14 +61,129 @@ metrics never reach the dashboard. It looks for one in this order: `K6W_K6_BIN`,
 
 ```bash
 export K6W_K6_BIN=/usr/local/bin/k6
-export INSIGHTEST_API_URL=https://insightest.example.com
-export INSIGHTEST_INGEST_API_KEY=…        # required by any deployment with a key configured
-export INSIGHTEST_PROJECT=my-org/my-project
+export INSIGHTEST_API_URL=https://insightest.example.com   # only for a deployed Insightest
+export INSIGHTEST_INGEST_API_KEY=tk_…     # the project's API key
 npx k6w run tests/load-test.js
 ```
 
+`INSIGHTEST_API_URL` defaults to `http://localhost:4000`, the local development
+API, so it only needs setting when Insightest runs somewhere else.
+
+### The project API key
+
+`INSIGHTEST_INGEST_API_KEY` is a key issued by Insightest against one project. It
+authenticates the wrapper *and* selects the project, so there is nothing else to
+configure: a key issued for one project cannot register runs against another, read
+another project's stored configuration, or touch another project's runs.
+
+Get one from the project's **General** settings in Insightest — *Run performance
+tests* → *Copy setup command* hands you the `export` line to run on the load host.
+The same key is available from `POST /api/projects/{id}/api-keys` for scripted
+setup. Either way it takes project editor or owner (a superadmin, or an owner/admin
+of the project's organization, also qualifies), the raw value is shown exactly once,
+and only its sha256 is stored.
+
+That makes `INSIGHTEST_PROJECT` optional. If you do set it, it must name the key's
+own project — a mismatch is rejected rather than silently redirected, which catches
+a repo configured for one project holding another's key.
+
+Revoke and rotate with `DELETE /api/projects/{id}/api-keys/{keyId}` — a project can
+hold several keys at once, so issue the new one, deploy it, then revoke the old.
+Issuing a key never invalidates an existing one, so a machine already set up keeps
+working when someone else copies a fresh command.
+
+#### Keeping the key off the command line
+
+The `export` line from the UI lasts as long as the shell it was pasted into. For
+something durable, `k6w` also reads the key from two optional files, so a clone is
+ready to run and no secret is ever a candidate for `git add`:
+
+```ini
+# ~/.config/insightest/credentials — per machine, chmod 600, holds the keys
+[default]
+api_key = tk_…
+
+[medical-apps]
+api_key = tk_…
+```
+
+```ini
+# .insightest — committed with the tests. Says which key, never what it is.
+profile = medical-apps
+api_url = https://insightest.example.com   # optional
+```
+
+The repo names the credential; the machine holds it. `.insightest` is found by
+walking up from the current directory, so it works from any subdirectory, and the
+profile falls back to `default` when no repo file exists — a single-project machine
+configures nothing anywhere. Then:
+
+```bash
+npx k6w run tests/load-test.js -o xk6-clickhouse
+```
+
+Precedence is environment first, so CI is unaffected: it injects
+`INSIGHTEST_INGEST_API_KEY` from its own secret store, has neither file, and none of
+this runs. `INSIGHTEST_PROFILE` overrides the repo file for a one-off, and
+`INSIGHTEST_CREDENTIALS` points at a different key file.
+
+Both files are parsed, never sourced. A key written into the committed `.insightest`
+is a hard error rather than a warning — that file is version-controlled, so a key in
+it is already leaked and needs revoking, not ignoring.
+
+Older deployments used a single shared `INSIGHTEST_INGEST_API_KEY` for every
+project, set on the server. That still works and still honours `INSIGHTEST_PROJECT`,
+but it cannot be scoped, revoked or attributed, and it is on its way out.
+
 Other useful variables: `K6W_CONTAINER` (comma-separated container names to sample
 Docker stats for), `K6W_DOCKER_SOCKET`, `K6W_STATS_INTERVAL`.
+
+### Configuration stored in Insightest
+
+Everything a run needs beyond the project's API key can live in Insightest instead
+of on the command line. Before `k6w` starts k6 it calls `GET /api/k6/config` and
+exports what it gets back, so a full invocation against the local API is:
+
+```bash
+INSIGHTEST_INGEST_API_KEY=tk_… npx k6w run tests/load-test.js -o xk6-clickhouse
+```
+
+The ClickHouse coordinates (`K6_CLICKHOUSE_ADDR`, `USER`, `PASSWORD`, `DB`,
+`PUSH_INTERVAL`) come from the server automatically — it already knows where its own
+metrics store is. Everything else is stored per project and managed through
+`/api/projects/{id}/env-vars`: target hosts (`HTTP_HOST`), the API tokens your
+script needs, and so on. Values can be marked secret, in which case they are
+encrypted at rest and masked everywhere except this response.
+
+Keep per-run choices out of it. `K6W_CONTAINER` is the clearest example: which
+container to sample depends on what you are testing right now, so it belongs on the
+command line even though the mechanism would happily store it.
+
+**A local value always wins.** `k6w` only fills in variables that are unset in your
+shell, so pointing a run at a local stack still works:
+
+```bash
+HTTP_HOST=http://localhost:9200 npx k6w run tests/load-test.js
+```
+
+**Environment profiles.** A project can store more than one set of values.
+`K6W_ENV` picks one, overlaid on the `default` profile, so shared values are stored
+once and only the differences are repeated:
+
+```bash
+K6W_ENV=staging npx k6w run tests/load-test.js
+```
+
+The fetch happens before `k6 inspect`, so a script that reads a variable at init
+time sees it. It is best-effort: if Insightest is unreachable or rejects the
+request, `k6w` says so and continues with whatever the shell provides — anything
+genuinely missing is then reported by k6 or the script itself. `K6W_SKIP_CONFIG_FETCH=1`
+disables it entirely.
+
+Two things are never taken from the server: names that decide what code the host
+runs (`PATH`, `LD_PRELOAD`, …) and host-local settings (`K6W_K6_BIN`,
+`K6W_DOCKER_SOCKET`), including the bootstrap variables above. The API refuses to
+store them and `k6w` refuses to apply them.
 
 ## Quick Start
 

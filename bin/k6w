@@ -62,16 +62,199 @@ _check_k6_clickhouse() {
 }
 _check_k6_clickhouse
 
-INSIGHTEST_API_URL="${INSIGHTEST_API_URL:-http://localhost:4000}"
+# ---------------------------------------------------------------------------
+# Client-side configuration: two optional files, so nothing has to be typed on
+# the command line and no secret has to live in the repository.
+#
+#   .insightest                       committed with the tests. Non-secret, per-repo:
+#                                     which key profile to use, optionally which
+#                                     Insightest. Found by walking up from the
+#                                     current directory, the way git finds its own.
+#   ~/.config/insightest/credentials   per machine, mode 0600, holds the API keys,
+#                                     one section per profile.
+#
+# The split is the point: the repo says *which* credential, the machine holds the
+# credential itself. A clone is then ready to run without anyone pasting a key, and
+# nothing secret is ever a candidate for `git add`.
+#
+# Precedence is always environment first: CI injects INSIGHTEST_INGEST_API_KEY from
+# its own secret store, has neither file, and none of this runs.
+#
+# Both files are parsed, never sourced — a file that executes shell on every load
+# test is the risk the protected-name list exists to prevent.
 
-# Ingest API key (X-API-Key). The Insightest ingest endpoints (register, container
-# stats, complete) are write endpoints and require this key on a real deployment.
-# When unset the calls go out without the header — fine for a local API that also
-# has no key configured, rejected (401) by one that does.
+_k6w_credentials_file() {
+  if [[ -n "${INSIGHTEST_CREDENTIALS:-}" ]]; then
+    printf '%s' "${INSIGHTEST_CREDENTIALS}"
+    return
+  fi
+  printf '%s' "${XDG_CONFIG_HOME:-${HOME}/.config}/insightest/credentials"
+}
+
+# Trim surrounding whitespace and one layer of matching quotes.
+_k6w_trim() {
+  local s="${1%$'\r'}"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  if [[ ${#s} -ge 2 && "${s:0:1}" == '"' && "${s: -1}" == '"' ]]; then
+    s="${s:1:${#s}-2}"
+  elif [[ ${#s} -ge 2 && "${s:0:1}" == "'" && "${s: -1}" == "'" ]]; then
+    s="${s:1:${#s}-2}"
+  fi
+  printf '%s' "${s}"
+}
+
+# Read the committed per-repo file. Only non-secret settings are accepted here, and
+# a key found in it is fatal: the file is version-controlled, so a key in it is a
+# leaked key, and continuing would let that go unnoticed.
+_load_repo_config() {
+  local file="" dir="${PWD}"
+  while [[ -n "${dir}" ]]; do
+    if [[ -f "${dir}/.insightest" ]]; then
+      file="${dir}/.insightest"
+      break
+    fi
+    [[ "${dir}" == "/" ]] && break
+    dir="$(dirname "${dir}")"
+  done
+  [[ -n "${file}" ]] || return 0
+  if [[ ! -r "${file}" ]]; then
+    echo "[k6w] Warning: cannot read ${file}" >&2
+    return 0
+  fi
+
+  local line key value
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="$(_k6w_trim "${line}")"
+    [[ -z "${line}" || "${line}" == \#* || "${line}" == \;* || "${line}" != *=* ]] && continue
+    key="$(printf '%s' "${line%%=*}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+    value="$(_k6w_trim "${line#*=}")"
+    case "${key}" in
+      profile)
+        [[ -z "${INSIGHTEST_PROFILE:-}" ]] && INSIGHTEST_PROFILE="${value}"
+        ;;
+      api_url)
+        [[ -z "${INSIGHTEST_API_URL:-}" ]] && INSIGHTEST_API_URL="${value}"
+        ;;
+      api_key | insightest_ingest_api_key)
+        echo "[k6w] Error: ${file} contains an API key." >&2
+        echo "[k6w]        That file is committed with the tests, so the key must be treated as" >&2
+        echo "[k6w]        leaked: revoke it in Insightest, issue a new one, and put the new one" >&2
+        echo "[k6w]        in $(_k6w_credentials_file) instead." >&2
+        exit 1
+        ;;
+      *)
+        echo "[k6w] Warning: ignoring unknown setting '${key}' in ${file}" >&2
+        ;;
+    esac
+  done < "${file}"
+}
+
+# Read the API key for the selected profile out of the per-machine credentials file.
+# Format is one section per profile:
+#
+#   [default]
+#   api_key = tk_…
+#
+#   [medical-apps]
+#   api_key = tk_…
+#
+# The profile is INSIGHTEST_PROFILE, else the `profile` line in .insightest, else
+# "default" — so a single-project machine names nothing anywhere.
+_load_api_key() {
+  # Already in the environment (CI secret, or an explicit one-off override).
+  [[ -n "${INSIGHTEST_INGEST_API_KEY:-}" ]] && return 0
+
+  local file; file="$(_k6w_credentials_file)"
+  [[ -f "${file}" ]] || return 0
+  if [[ ! -r "${file}" ]]; then
+    echo "[k6w] Warning: cannot read ${file}" >&2
+    return 0
+  fi
+
+  # A key readable by other accounts on the host is worth saying out loud, but not
+  # worth refusing to run over — the run would fail confusingly a moment later.
+  local mode
+  mode="$(stat -c '%a' "${file}" 2>/dev/null || stat -f '%Lp' "${file}" 2>/dev/null || printf '')"
+  if [[ -n "${mode}" && "${mode}" != "600" && "${mode}" != "400" ]]; then
+    echo "[k6w] Warning: ${file} is mode ${mode} and holds API keys — chmod 600 it" >&2
+  fi
+
+  local want="${INSIGHTEST_PROFILE:-default}" section="" line key value found=""
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="$(_k6w_trim "${line}")"
+    [[ -z "${line}" || "${line}" == \#* || "${line}" == \;* ]] && continue
+    if [[ "${line}" == \[*\] ]]; then
+      section="$(_k6w_trim "${line:1:${#line}-2}")"
+      continue
+    fi
+    [[ "${section}" == "${want}" && "${line}" == *=* ]] || continue
+    key="$(printf '%s' "${line%%=*}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+    value="$(_k6w_trim "${line#*=}")"
+    [[ "${key}" == "api_key" ]] && found="${value}"
+  done < "${file}"
+
+  if [[ -z "${found}" ]]; then
+    echo "[k6w] Warning: no api_key for profile [${want}] in ${file}" >&2
+    return 0
+  fi
+  export INSIGHTEST_INGEST_API_KEY="${found}"
+  # Only the prefix, which is what Insightest itself displays for a key.
+  echo "[k6w] Using the API key for profile [${want}] (${found:0:10}…)"
+}
+
+_load_repo_config
+_load_api_key
+
+# The Insightest instance runs at a known address, so the wrapper ships with it
+# rather than making every caller repeat it. This is the one line to change if that
+# address ever moves — and moving it means cutting an SDK release and bumping the
+# dependency in each test repo, since this file is published as part of the SDK.
+#
+# Note this value is public: releases mirror SDKs/k6 to a public repository. Only
+# ever put an address here that is fine to publish; INSIGHTEST_INGEST_API_KEY is
+# the credential and never belongs in this file.
+K6W_DEFAULT_API_URL="http://localhost:4000"
+
+# Running against a local stack, a staging instance or a branch deployment is a
+# matter of overriding this one variable, or setting api_url in .insightest:
+#   INSIGHTEST_API_URL=http://localhost:4000 npx k6w run tests/load-test.js
+# Exported so it also lands in the run record, which is then explicit about which
+# Insightest the run registered against.
+export INSIGHTEST_API_URL="${INSIGHTEST_API_URL:-${K6W_DEFAULT_API_URL}}"
+
+# Project API key (X-API-Key), created in Insightest under the project this repo's
+# tests belong to. It authenticates every call the wrapper makes and identifies the
+# project, so a key issued for one project cannot register runs against another or
+# read another's stored configuration — which is why INSIGHTEST_PROJECT is optional
+# once a key is set.
+#
+# By this point it has come from the environment or from the credentials file (see
+# _load_api_key). When it is still unset the calls go out without the header, which
+# a deployment with keys configured rejects with 401.
 API_KEY_HEADER=()
 if [[ -n "${INSIGHTEST_INGEST_API_KEY:-}" ]]; then
   API_KEY_HEADER=(-H "X-API-Key: ${INSIGHTEST_INGEST_API_KEY}")
 fi
+
+# Environment profile to request from Insightest (see _fetch_insightest_config).
+# "default" is the profile every project has; another name is overlaid on top of it.
+K6W_ENV="${K6W_ENV:-default}"
+
+# Names Insightest is never allowed to set on this host, even if a response
+# contains them. The first group decides which programs and libraries the shell
+# and k6 load; the second is host-local (the k6 binary, the Docker socket) or is
+# the bootstrap config used to reach the API in the first place. The API refuses
+# to store or serve these too — this is the client half of that check, so an older
+# or compromised API cannot push one to a newer wrapper.
+K6W_PROTECTED_ENV="PATH IFS ENV BASH_ENV SHELL HOME LD_PRELOAD LD_LIBRARY_PATH
+DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH NODE_OPTIONS K6W_K6_BIN K6W_SELF
+K6W_RUN_ID K6W_DOCKER_SOCKET INSIGHTEST_PROFILE INSIGHTEST_API_URL
+INSIGHTEST_INGEST_API_KEY INSIGHTEST_CREDENTIALS INSIGHTEST_MASTER_KEY"
+
+# Names of variables Insightest flagged as secret. Collected by the config fetch
+# so _build_env_json masks them instead of recording them in clear on the run.
+K6W_SERVER_SECRETS=()
 
 # Docker socket used to sample container stats locally. k6w runs on the host where
 # the target containers live, so it reads the daemon here and forwards samples to
@@ -88,6 +271,101 @@ _try_curl() {
     return 0
   fi
   curl "$@"
+}
+
+# True when a variable name must never be set from a server response.
+_is_protected_env() {
+  local candidate protected
+  candidate=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')
+  for protected in ${K6W_PROTECTED_ENV}; do
+    [[ "${candidate}" == "${protected}" ]] && return 0
+  done
+  return 1
+}
+
+# Fetch this project's stored configuration from Insightest and export it.
+#
+# This is what keeps connection details and test inputs off the command line: the
+# ClickHouse coordinates, the target host, K6W_CONTAINER and anything else stored
+# against the project arrive here. It runs before `k6 inspect` and before the k6
+# binary starts, so a script that reads a variable at init time sees it.
+#
+# Precedence: a variable already set in this shell is never overwritten, so an
+# explicit `HTTP_HOST=… k6w run …` still points where you told it to. Only
+# variables that are unset (or empty) locally are filled in from Insightest.
+#
+# The response is tab-separated (NAME<TAB>VALUE<TAB>1|0, with the flag marking a
+# secret) rather than JSON, because jq is not installed everywhere k6 runs.
+# Lines beginning with # are messages from the API and are echoed as warnings.
+#
+# Best-effort, like registration: a rejected or unreachable API is reported and
+# the run continues, since every variable may equally well come from the shell.
+# When something really is missing, k6 or the test script says so by name.
+_fetch_insightest_config() {
+  if [[ "${K6W_SKIP_CONFIG_FETCH:-}" == "1" ]]; then
+    return 0
+  fi
+  if ! command -v curl > /dev/null 2>&1; then
+    echo "[k6w] Warning: curl not available — skipping Insightest config fetch" >&2
+    return 0
+  fi
+
+  # --data-urlencode with -G puts the parameters in the query string already
+  # encoded, so a project or profile name containing / or a space is safe.
+  local curl_args=(-s -G --data-urlencode "format=env" --data-urlencode "env=${K6W_ENV}")
+  if [[ -n "${INSIGHTEST_PROJECT:-}" ]]; then
+    curl_args+=(--data-urlencode "project=${INSIGHTEST_PROJECT}")
+  fi
+
+  local body_file status
+  body_file="$(mktemp 2>/dev/null || echo "/tmp/k6w_config_$$")"
+  status=$(curl "${curl_args[@]}" -o "${body_file}" -w '%{http_code}' \
+    "${API_KEY_HEADER[@]}" -H 'Accept: text/plain' \
+    "${INSIGHTEST_API_URL}/api/k6/config" 2>/dev/null) || status="000"
+
+  if [[ ! "${status}" =~ ^2 ]]; then
+    if [[ "${status}" == "000" ]]; then
+      echo "[k6w] Warning: could not reach Insightest at ${INSIGHTEST_API_URL} to load configuration" >&2
+      echo "[k6w]          continuing with the variables set in this shell." >&2
+    else
+      echo "[k6w] ============================================================" >&2
+      echo "[k6w] WARNING: configuration fetch was REJECTED (HTTP ${status})." >&2
+      echo "[k6w]          $(cat "${body_file}" 2>/dev/null)" >&2
+      echo "[k6w]          Stored variables (ClickHouse, target hosts, containers)" >&2
+      echo "[k6w]          were NOT loaded. Check INSIGHTEST_INGEST_API_KEY and" >&2
+      echo "[k6w]          INSIGHTEST_PROJECT, or set the variables in this shell." >&2
+      echo "[k6w] ============================================================" >&2
+    fi
+    rm -f "${body_file}" 2>/dev/null || true
+    return 0
+  fi
+
+  local applied=0 name value secret
+  while IFS=$'\t' read -r name value secret || [[ -n "${name:-}" ]]; do
+    [[ -z "${name}" ]] && continue
+    if [[ "${name}" == \#* ]]; then
+      echo "[k6w] Insightest: ${name#\#}" >&2
+      continue
+    fi
+    if [[ ! "${name}" =~ ^[A-Za-z_][A-Za-z0-9_]{0,127}$ ]]; then
+      echo "[k6w] Warning: ignoring malformed variable name in the Insightest response" >&2
+      continue
+    fi
+    if _is_protected_env "${name}"; then
+      echo "[k6w] Warning: refusing to set reserved variable ${name} from Insightest" >&2
+      continue
+    fi
+    # Locally set wins: leave it alone.
+    [[ -n "${!name:-}" ]] && continue
+    export "${name}=${value}"
+    if [[ "${secret:-}" == "1" ]]; then
+      K6W_SERVER_SECRETS+=("${name}")
+    fi
+    applied=$((applied + 1))
+  done < "${body_file}"
+  rm -f "${body_file}" 2>/dev/null || true
+
+  echo "[k6w] Loaded ${applied} variable(s) from Insightest (environment: ${K6W_ENV})"
 }
 
 # Sample Docker stats for one container and post each sample to Insightest until
@@ -174,6 +452,13 @@ if [[ "${1:-}" != "run" ]]; then
   exec "${K6_BIN}" "$@"
 fi
 
+# Load the project's stored configuration before anything reads the environment:
+# `k6 inspect` below, the container-stats collector (K6W_CONTAINER), the k6 output
+# extension (K6_CLICKHOUSE_*) and the test script itself all depend on it. This
+# runs on the rerun path too, so a replayed run picks up current connection
+# details instead of whatever was stored with the original run.
+_fetch_insightest_config
+
 # If K6W_RUN_ID is set, a run_id was pre-assigned by the API (rerun path) — skip UUID generation and registration
 if [[ -n "${K6W_RUN_ID:-}" ]]; then
   RUN_ID="${K6W_RUN_ID}"
@@ -192,16 +477,23 @@ else
 
   # Collect test-specific env vars as a JSON object.
   # K6_CLICKHOUSE_* are excluded — the server already has them via CLICKHOUSE_* in its own env.
-  # Values containing PASSWORD or SECRET are masked.
+  # INSIGHTEST_PROJECT is recorded so `k6w rerun` can resolve the same project (and
+  # with it the same stored configuration) without it being set in the shell.
+  # Masked values: anything whose name suggests a credential, plus every variable
+  # Insightest served as a secret — those came from the server and are fetched
+  # again on the next run, so there is no reason to keep a copy on the run row.
   _build_env_json() {
-    local json="{" sep=""
+    local json="{" sep="" server_secret
     while IFS= read -r line; do
       local key="${line%%=*}"
       local val="${line#*=}"
       [[ "$key" =~ ^K6_CLICKHOUSE_(ADDR|USER|PASSWORD|DB)$ ]] && continue
       [[ "$key" == "K6W_RUN_ID" ]] && continue
-      [[ "$key" =~ ^K6_ || "$key" =~ ^K6W_ || "$key" == "HTTP_HOST" || "$key" == "INSIGHTEST_API_URL" ]] || continue
-      [[ "$key" =~ PASSWORD|SECRET ]] && val="***"
+      [[ "$key" =~ ^K6_ || "$key" =~ ^K6W_ || "$key" == "HTTP_HOST" || "$key" == "INSIGHTEST_API_URL" || "$key" == "INSIGHTEST_PROJECT" ]] || continue
+      [[ "$key" =~ PASSWORD|SECRET|TOKEN|API_KEY ]] && val="***"
+      for server_secret in ${K6W_SERVER_SECRETS[@]+"${K6W_SERVER_SECRETS[@]}"}; do
+        [[ "$key" == "$server_secret" ]] && val="***" && break
+      done
       val="${val//\\/\\\\}"; val="${val//\"/\\\"}"
       json+="${sep}\"${key}\":\"${val}\""
       sep=","
