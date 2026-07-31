@@ -1,14 +1,18 @@
 {
   "name": "k6-perf-sdk",
-  "version": "1.1.3",
+  "version": "1.1.5",
   "description": "Modular k6 performance-testing SDK (templates, HTTP/gRPC clients, auth, config) plus the k6w wrapper that registers runs with Insightest.",
   "main": "index.js",
   "bin": {
     "k6w": "bin/k6w"
   },
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js"
+  },
   "files": [
     "index.js",
     "bin/k6w",
+    "scripts/postinstall.js",
     "auth/",
     "config/",
     "gRPC/",

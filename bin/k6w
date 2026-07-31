@@ -5,6 +5,425 @@ set -euo pipefail
 # subcommand can re-exec it from the original test's working directory.
 K6W_SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
+# ---------------------------------------------------------------------------
+# The k6 toolchain this SDK release is built against. Pinned here, in one place,
+# because the two halves are coupled: the ClickHouse output extension decides the
+# shape of what lands in the metrics store, and Insightest reads that shape back.
+# A binary built with a different extension version can stream metrics that never
+# show up in the dashboard, with nothing visibly wrong at either end.
+#
+# `k6w install-k6` builds exactly this combination, so the wrapper and the binary it
+# delegates to cannot drift. Changing either version means cutting an SDK release.
+K6W_K6_VERSION="v2.0.0"
+K6W_XK6_EXTENSION="github.com/mkutlak/xk6-output-clickhouse@v0.6.0"
+# Image used to build without requiring a Go toolchain on the host.
+K6W_XK6_IMAGE="grafana/xk6"
+# Where install-k6 puts the binary when .insightest.env does not say otherwise.
+# Relative to the repo root, and language-agnostic on purpose: the SDK is consumed
+# by Node, Go and Python repos, and none of their conventions fit the others.
+K6W_DEFAULT_K6_BIN="tools/k6/k6"
+
+# ---------------------------------------------------------------------------
+# Client-side configuration: one file, .insightest.env, at the root of the test
+# repository. It holds everything a run needs that is not the k6 command itself —
+# which Insightest to talk to, the project API key, which k6 binary to use, which
+# containers to sample — so none of it has to be retyped on every invocation.
+#
+# The file is not committed: it holds the key. `k6w init` and the SDK's postinstall
+# both create it from templates/insightest.env.example and add it to .gitignore.
+#
+# Precedence is always environment first: a variable already set in this shell is
+# never overwritten, so CI injects INSIGHTEST_INGEST_API_KEY from its own secret
+# store, has no file, and none of this matters. A one-off
+# `INSIGHTEST_API_URL=… k6w run …` likewise still points where it was told to.
+#
+# The file is parsed, never sourced — a file that executes shell on every load test
+# is the risk the protected-name list further down exists to prevent.
+
+# Trim surrounding whitespace and one layer of matching quotes.
+_k6w_trim() {
+  local s="${1%$'\r'}"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  if [[ ${#s} -ge 2 && "${s:0:1}" == '"' && "${s: -1}" == '"' ]]; then
+    s="${s:1:${#s}-2}"
+  elif [[ ${#s} -ge 2 && "${s:0:1}" == "'" && "${s: -1}" == "'" ]]; then
+    s="${s:1:${#s}-2}"
+  fi
+  printf '%s' "${s}"
+}
+
+K6W_ENV_FILE_NAME=".insightest.env"
+
+# Locate the env file: an explicit K6W_ENV_FILE, else the nearest .insightest.env
+# found by walking up from the current directory, the way git finds its own config.
+# Running a test from a subdirectory of the repo therefore works unchanged.
+_k6w_find_env_file() {
+  if [[ -n "${K6W_ENV_FILE:-}" ]]; then
+    printf '%s' "${K6W_ENV_FILE}"
+    return
+  fi
+  local dir="${PWD}"
+  while [[ -n "${dir}" ]]; do
+    if [[ -f "${dir}/${K6W_ENV_FILE_NAME}" ]]; then
+      printf '%s' "${dir}/${K6W_ENV_FILE_NAME}"
+      return
+    fi
+    [[ "${dir}" == "/" ]] && break
+    dir="$(dirname "${dir}")"
+  done
+  printf ''
+}
+
+# Path of the loaded file, so later messages can name it. Empty when none was found.
+K6W_ENV_FILE_LOADED=""
+
+# The repo the tests belong to: the directory holding .insightest.env, else the
+# current directory. Relative paths in that file resolve against this rather than
+# against $PWD, so `K6W_K6_BIN=tools/k6/k6` keeps working when a test is run from a
+# subdirectory — the file is found by walking up, and its contents should not mean
+# something different depending on how deep you were standing.
+_k6w_repo_root() {
+  if [[ -n "${K6W_ENV_FILE_LOADED}" ]]; then
+    dirname "${K6W_ENV_FILE_LOADED}"
+    return
+  fi
+  printf '%s' "${PWD}"
+}
+
+# Absolute form of a path that may be relative to the repo root.
+_k6w_abs_path() {
+  local p="$1"
+  [[ "${p}" == /* ]] && { printf '%s' "${p}"; return; }
+  printf '%s/%s' "$(_k6w_repo_root)" "${p}"
+}
+
+_load_env_file() {
+  local file; file="$(_k6w_find_env_file)"
+  if [[ -z "${file}" ]]; then
+    # Not an error: the environment may carry everything already (CI), and the
+    # wrapper still has a default API URL. Anything genuinely missing is reported
+    # by name later, by the config fetch or by k6 itself.
+    return 0
+  fi
+  if [[ ! -r "${file}" ]]; then
+    echo "[k6w] Warning: cannot read ${file}" >&2
+    return 0
+  fi
+  K6W_ENV_FILE_LOADED="${file}"
+
+  # A file holding an API key that other accounts on the host can read is worth
+  # saying out loud, but not worth refusing to run over — the run would fail
+  # confusingly a moment later for an unrelated-looking reason.
+  local mode
+  mode="$(stat -c '%a' "${file}" 2>/dev/null || stat -f '%Lp' "${file}" 2>/dev/null || printf '')"
+  if [[ -n "${mode}" && "${mode}" != "600" && "${mode}" != "400" ]]; then
+    echo "[k6w] Warning: ${file} is mode ${mode} and holds an API key — chmod 600 it" >&2
+  fi
+
+  local applied=0 lineno=0 line name value
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    lineno=$((lineno + 1))
+    line="$(_k6w_trim "${line}")"
+    [[ -z "${line}" || "${line}" == \#* || "${line}" == \;* || "${line}" != *=* ]] && continue
+    # `export FOO=bar` is what people paste out of habit; accept it.
+    [[ "${line}" == export[[:space:]]* ]] && line="$(_k6w_trim "${line#export}")"
+    name="$(printf '%s' "${line%%=*}" | tr -d '[:space:]')"
+    value="$(_k6w_trim "${line#*=}")"
+    if [[ ! "${name}" =~ ^[A-Za-z_][A-Za-z0-9_]{0,127}$ ]]; then
+      echo "[k6w] Warning: ignoring malformed variable name at ${file}:${lineno}" >&2
+      continue
+    fi
+    # An empty value in the file counts as unset — the shipped template ships
+    # INSIGHTEST_INGEST_API_KEY= and K6W_CONTAINER= blank, and exporting those
+    # empty would only mask the real diagnostics.
+    [[ -z "${value}" ]] && continue
+    # Already set in this shell: leave it alone. Written as `if` rather than an
+    # AND-list because under `set -e` a failing AND-list at the end of a loop
+    # body becomes the status of the loop and kills the run.
+    if [[ -n "${!name:-}" ]]; then
+      continue
+    fi
+    export "${name}=${value}"
+    applied=$((applied + 1))
+  done < "${file}"
+
+  echo "[k6w] Loaded ${applied} variable(s) from ${file}"
+  if [[ -n "${INSIGHTEST_INGEST_API_KEY:-}" ]]; then
+    # Only the prefix, which is what Insightest itself displays for a key.
+    echo "[k6w] Using API key ${INSIGHTEST_INGEST_API_KEY:0:10}…"
+  fi
+}
+
+# The one protection carried over from the file this replaces: .insightest was
+# committed, so a key found in it was a leaked key and fatal. .insightest.env is
+# meant to be ignored, so a key in it is not yet leaked — but if the ignore rule is
+# missing it is one `git add` away from being published, which is worth interrupting
+# for. A warning rather than an exit: the right fix is one line in .gitignore, and
+# failing the run would be a disproportionate way to ask for it.
+_warn_if_env_file_tracked() {
+  [[ -n "${K6W_ENV_FILE_LOADED}" && -n "${INSIGHTEST_INGEST_API_KEY:-}" ]] || return 0
+  command -v git > /dev/null 2>&1 || return 0
+  local dir; dir="$(dirname "${K6W_ENV_FILE_LOADED}")"
+  git -C "${dir}" rev-parse --is-inside-work-tree > /dev/null 2>&1 || return 0
+  git -C "${dir}" check-ignore -q "${K6W_ENV_FILE_LOADED}" 2>/dev/null && return 0
+  echo "[k6w] ============================================================" >&2
+  echo "[k6w] WARNING: ${K6W_ENV_FILE_LOADED} holds an API key and is NOT" >&2
+  echo "[k6w]          git-ignored. Add this line to .gitignore before you commit:" >&2
+  echo "[k6w]            ${K6W_ENV_FILE_NAME}" >&2
+  echo "[k6w]          Or run 'k6w init', which adds it for you." >&2
+  echo "[k6w] ============================================================" >&2
+}
+
+# Add one pattern to the repo's .gitignore, if it is not already covered.
+#
+# Only ever amends an existing .gitignore: creating one in a repo that has none is a
+# decision about that repository, not about the file being ignored.
+_k6w_ensure_gitignored() {
+  local pattern="$1" comment="$2"
+  local ignore; ignore="$(_k6w_repo_root)/.gitignore"
+  if [[ ! -f "${ignore}" ]]; then
+    echo "[k6w] Warning: no .gitignore here — make sure ${pattern} is not committed" >&2
+    return 0
+  fi
+  if grep -qxF "${pattern}" "${ignore}" 2>/dev/null \
+    || grep -qxF "/${pattern}" "${ignore}" 2>/dev/null; then
+    return 0
+  fi
+  # A file not ending in a newline would otherwise get this appended to its last line,
+  # silently changing an unrelated pattern.
+  if [[ -s "${ignore}" && -n "$(tail -c 1 "${ignore}" 2>/dev/null)" ]]; then
+    printf '\n' >> "${ignore}"
+  fi
+  printf '\n# %s\n%s\n' "${comment}" "${pattern}" >> "${ignore}"
+  echo "[k6w] Added ${pattern} to .gitignore"
+}
+
+# GOOS/GOARCH for the machine this is running on.
+#
+# This is the detail the plain `docker run grafana/xk6 build …` command gets wrong
+# away from Linux: the build happens inside a Linux container, so it produces a Linux
+# binary, which a macOS host cannot execute. xk6 honours GOOS/GOARCH, so passing the
+# host's own values cross-compiles for wherever the run will actually happen.
+_k6w_host_goos() {
+  case "$(uname -s 2>/dev/null || printf 'Linux')" in
+    Darwin) printf 'darwin' ;;
+    Linux)  printf 'linux' ;;
+    MINGW* | MSYS* | CYGWIN*) printf 'windows' ;;
+    *) printf 'linux' ;;
+  esac
+}
+_k6w_host_goarch() {
+  case "$(uname -m 2>/dev/null || printf 'x86_64')" in
+    x86_64 | amd64) printf 'amd64' ;;
+    aarch64 | arm64) printf 'arm64' ;;
+    armv7l) printf 'arm' ;;
+    *) printf 'amd64' ;;
+  esac
+}
+
+# Does this binary advertise the clickhouse output extension?
+_k6w_has_clickhouse() {
+  local bin="$1"
+  [[ -x "${bin}" ]] || return 1
+  "${bin}" version 2>/dev/null | grep -qi 'clickhouse'
+}
+
+# Build the k6 binary this SDK release is pinned to, into the location the repo's
+# config points at (default tools/k6/k6), and make sure git ignores it.
+#
+# Two ways to build, in order of how little the host has to have installed:
+#
+#   1. Docker, using grafana/xk6. Needs no Go toolchain — which is the point, since
+#      the repos consuming this SDK are Node, Go and Python, and only one of those
+#      can be assumed to have Go. Cross-compiled for the host via GOOS/GOARCH.
+#   2. A native xk6 already on PATH, for a host with Go set up and no Docker.
+#
+# Both need network access on first run: either pulling the image or fetching the Go
+# modules the extension depends on.
+#
+# Idempotent. An existing binary that already advertises the extension is left alone,
+# because rebuilding it takes minutes and changes nothing.
+_do_install_k6() {
+  local force=0
+  [[ "${1:-}" == "--force" ]] && force=1
+
+  local rel="${K6W_K6_BIN:-${K6W_DEFAULT_K6_BIN}}"
+  local dest; dest="$(_k6w_abs_path "${rel}")"
+  local dest_dir; dest_dir="$(dirname "${dest}")"
+  local dest_name; dest_name="$(basename "${dest}")"
+
+  # The ignore pattern has to be written the way .gitignore reads it: relative to the
+  # repo root. A destination outside the repo is not ours to ignore.
+  local root; root="$(_k6w_repo_root)"
+  local rel_dest="${dest#"${root}/"}"
+
+  if [[ ${force} -eq 0 && -x "${dest}" ]]; then
+    if _k6w_has_clickhouse "${dest}"; then
+      echo "[k6w] Already installed: ${dest}"
+      echo "[k6w]   $("${dest}" version 2>/dev/null | head -1)"
+      [[ "${rel_dest}" != "${dest}" ]] && _k6w_ensure_gitignored "${rel_dest}" \
+        "k6 binary built by 'k6w install-k6' — a build artifact, not source"
+      echo "[k6w] Pass --force to rebuild."
+      return 0
+    fi
+    echo "[k6w] ${dest} exists but has no clickhouse extension — rebuilding it"
+  fi
+
+  mkdir -p "${dest_dir}" || {
+    echo "[k6w] Error: could not create ${dest_dir}" >&2
+    exit 1
+  }
+
+  local goos goarch
+  goos="$(_k6w_host_goos)"
+  goarch="$(_k6w_host_goarch)"
+
+  echo "[k6w] Building k6 ${K6W_K6_VERSION} with ${K6W_XK6_EXTENSION}"
+  echo "[k6w]   target: ${goos}/${goarch}"
+  echo "[k6w]   output: ${dest}"
+  echo "[k6w] This takes a few minutes the first time."
+
+  if command -v docker > /dev/null 2>&1 && docker info > /dev/null 2>&1; then
+    echo "[k6w] Using Docker (${K6W_XK6_IMAGE}) — no Go toolchain needed."
+    # -u keeps the output owned by the invoking user rather than root. The destination
+    # directory is mounted rather than the repo, so the build can only write there.
+    if ! docker run --rm \
+      -u "$(id -u):$(id -g)" \
+      -e "GOOS=${goos}" -e "GOARCH=${goarch}" \
+      -e "GOFLAGS=-buildvcs=false" \
+      -v "${dest_dir}:/xk6" \
+      "${K6W_XK6_IMAGE}" \
+      build "${K6W_K6_VERSION}" \
+      --with "${K6W_XK6_EXTENSION}" \
+      --output "/xk6/${dest_name}"
+    then
+      echo "[k6w] Error: the Docker build failed." >&2
+      echo "[k6w]        Check that Docker can pull ${K6W_XK6_IMAGE} and reach the network." >&2
+      exit 1
+    fi
+  elif command -v xk6 > /dev/null 2>&1; then
+    echo "[k6w] Docker unavailable; using the xk6 on PATH."
+    if ! GOOS="${goos}" GOARCH="${goarch}" \
+      xk6 build "${K6W_K6_VERSION}" \
+        --with "${K6W_XK6_EXTENSION}" \
+        --output "${dest}"
+    then
+      echo "[k6w] Error: the xk6 build failed." >&2
+      exit 1
+    fi
+  else
+    echo "[k6w] Error: cannot build k6 — neither Docker nor xk6 is available." >&2
+    echo "[k6w]        Install one of:" >&2
+    echo "[k6w]          Docker    https://docs.docker.com/get-docker/  (no Go needed)" >&2
+    echo "[k6w]          xk6       go install go.k6.io/xk6/cmd/xk6@latest" >&2
+    echo "[k6w]        Or build the binary elsewhere and point K6W_K6_BIN at it in" >&2
+    echo "[k6w]        ${K6W_ENV_FILE_NAME}:" >&2
+    echo "[k6w]          xk6 build ${K6W_K6_VERSION} --with ${K6W_XK6_EXTENSION}" >&2
+    exit 1
+  fi
+
+  chmod +x "${dest}" 2>/dev/null || true
+
+  # Verify rather than trust. A build that produced something unusable, or a
+  # cross-compiled binary that cannot run here, is worth saying so now instead of
+  # surfacing as a mystery in the middle of a load test.
+  if [[ ! -x "${dest}" ]]; then
+    echo "[k6w] Error: build reported success but ${dest} is not executable" >&2
+    exit 1
+  fi
+  if _k6w_has_clickhouse "${dest}"; then
+    echo "[k6w] Installed: $("${dest}" version 2>/dev/null | head -1)"
+  elif "${dest}" version > /dev/null 2>&1; then
+    echo "[k6w] Warning: ${dest} runs but does not report the clickhouse extension" >&2
+  else
+    echo "[k6w] Warning: ${dest} was built but will not run on this machine" >&2
+    echo "[k6w]          (built for ${goos}/${goarch})" >&2
+  fi
+
+  if [[ "${rel_dest}" != "${dest}" ]]; then
+    _k6w_ensure_gitignored "${rel_dest}" \
+      "k6 binary built by 'k6w install-k6' — a build artifact, not source"
+  fi
+}
+
+# Create .insightest.env in the current directory from the template shipped with the
+# SDK, and make sure git ignores it. The SDK's postinstall does the same thing on
+# install; this is the hand-run equivalent, for a repo that installed before this
+# existed, for a clone that deleted the file, or for provisioning a load host.
+#
+# Never overwrites: the existing file holds a working key, and a scaffolding command
+# that discards a credential is a scaffolding command nobody runs twice.
+_do_init() {
+  local target="${PWD}/${K6W_ENV_FILE_NAME}"
+
+  # The template lives inside the package, alongside the wrapper's own directory.
+  # Installed as an npm dependency the wrapper is invoked through
+  # node_modules/.bin/k6w, so the package's files are only reachable through the
+  # symlink target — the same resolution the k6 binary lookup below performs.
+  local template="" candidate self_dir real_dir
+  self_dir="$(dirname "${K6W_SELF}")"
+  real_dir="$(dirname "$(readlink -f "${K6W_SELF}" 2>/dev/null || printf '%s' "${K6W_SELF}")")"
+  for candidate in \
+    "${self_dir}/../templates/insightest.env.example" \
+    "${real_dir}/../templates/insightest.env.example"
+  do
+    if [[ -f "${candidate}" ]]; then
+      template="${candidate}"
+      break
+    fi
+  done
+  if [[ -z "${template}" ]]; then
+    echo "[k6w] Error: could not find templates/insightest.env.example in the SDK package" >&2
+    exit 1
+  fi
+
+  if [[ -e "${target}" ]]; then
+    echo "[k6w] ${K6W_ENV_FILE_NAME} already exists — leaving it alone"
+  else
+    cp "${template}" "${target}"
+    chmod 600 "${target}" 2>/dev/null || true
+    echo "[k6w] Created ${target}"
+    # The file just appeared, so re-read it: install-k6 below needs the K6W_K6_BIN it
+    # carries, and the first load happened before it existed.
+    K6W_ENV_FILE_LOADED=""
+    _load_env_file
+  fi
+
+  _k6w_ensure_gitignored "${K6W_ENV_FILE_NAME}" \
+    "Insightest performance-test config — holds the project API key"
+
+  # Build the k6 binary too, so one command leaves the repo actually able to run a
+  # test. Skippable, because it needs Docker or Go and takes minutes — a repo that
+  # already has a binary, or wants to supply its own, should not be made to wait.
+  if [[ "${K6W_SKIP_K6_INSTALL:-}" == "1" ]]; then
+    echo "[k6w] Skipping the k6 build (K6W_SKIP_K6_INSTALL=1)."
+  else
+    echo "[k6w] ---"
+    _do_install_k6 || true
+    echo "[k6w] ---"
+  fi
+
+  echo "[k6w] Next: paste a project API key into INSIGHTEST_INGEST_API_KEY."
+  echo "[k6w]       Insightest → your project → Run performance tests → Generate API key"
+}
+
+# Loaded before the k6 binary is resolved, because K6W_K6_BIN is one of the things
+# the file exists to set.
+_load_env_file
+
+# The setup subcommands are dispatched here, before the k6 binary is resolved: their
+# whole purpose is to run on a host that does not have a usable k6 yet, so they must
+# not go through a resolver that exits when K6W_K6_BIN points at nothing.
+if [[ "${1:-}" == "init" ]]; then
+  _do_init
+  exit 0
+fi
+if [[ "${1:-}" == "install-k6" ]]; then
+  _do_install_k6 "${2:-}"
+  exit 0
+fi
+
 # Resolve the k6 binary to run. This lets the wrapper live in a different location
 # from the binary (e.g. k6w installed via an SDK, custom binary installed on the
 # host). Resolution order, first match wins:
@@ -15,14 +434,20 @@ K6W_SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 #      dependency the wrapper is invoked through node_modules/.bin/k6w, so a k6
 #      shipped inside the package itself is only visible through the real path
 #   4. `k6` found on PATH (e.g. `xk6 build` installed to /usr/local/bin)
-#   5. legacy `./k6` relative to the current working directory
+#   5. the default install location, tools/k6/k6 under the repo root
+#   6. legacy `./k6` relative to the current working directory
 _resolve_k6_bin() {
   if [[ -n "${K6W_K6_BIN:-}" ]]; then
-    if [[ ! -x "${K6W_K6_BIN}" ]]; then
+    # Relative values resolve against the repo root, not $PWD — see _k6w_repo_root.
+    local explicit; explicit="$(_k6w_abs_path "${K6W_K6_BIN}")"
+    if [[ ! -x "${explicit}" ]]; then
       echo "[k6w] Error: K6W_K6_BIN=${K6W_K6_BIN} is not an executable file" >&2
+      echo "[k6w]        (looked for ${explicit})" >&2
+      echo "[k6w]        Run 'k6w install-k6' to build it, or point K6W_K6_BIN at an" >&2
+      echo "[k6w]        existing xk6-clickhouse build of k6." >&2
       exit 1
     fi
-    printf '%s' "${K6W_K6_BIN}"
+    printf '%s' "${explicit}"
     return
   fi
   local self_dir; self_dir="$(dirname "${K6W_SELF}")"
@@ -41,6 +466,13 @@ _resolve_k6_bin() {
     command -v k6
     return
   fi
+  # Where install-k6 puts it. Checked even when .insightest.env does not name it, so
+  # a repo whose config file predates K6W_K6_BIN still finds an installed binary.
+  local default_bin; default_bin="$(_k6w_abs_path "${K6W_DEFAULT_K6_BIN}")"
+  if [[ -x "${default_bin}" ]]; then
+    printf '%s' "${default_bin}"
+    return
+  fi
   printf '%s' "./k6"
 }
 K6_BIN="$(_resolve_k6_bin)"
@@ -52,164 +484,23 @@ _check_k6_clickhouse() {
   local ver
   ver="$("${K6_BIN}" version 2>/dev/null)" || {
     echo "[k6w] Warning: could not run '${K6_BIN} version' to verify the k6 binary" >&2
+    echo "[k6w]          Run 'k6w install-k6' to build the one this SDK expects." >&2
     return
   }
   if ! printf '%s' "${ver}" | grep -qi 'clickhouse'; then
     echo "[k6w] Warning: resolved k6 binary '${K6_BIN}' has no clickhouse extension" >&2
     echo "[k6w]          metrics will NOT reach ClickHouse and the run won't show in the dashboard." >&2
-    echo "[k6w]          Point K6W_K6_BIN at the xk6-clickhouse build of k6." >&2
+    echo "[k6w]          Run 'k6w install-k6' to build one, or point K6W_K6_BIN at an" >&2
+    echo "[k6w]          existing xk6-clickhouse build." >&2
   fi
 }
 _check_k6_clickhouse
 
-# ---------------------------------------------------------------------------
-# Client-side configuration: two optional files, so nothing has to be typed on
-# the command line and no secret has to live in the repository.
-#
-#   .insightest                       committed with the tests. Non-secret, per-repo:
-#                                     which key profile to use, optionally which
-#                                     Insightest. Found by walking up from the
-#                                     current directory, the way git finds its own.
-#   ~/.config/insightest/credentials   per machine, mode 0600, holds the API keys,
-#                                     one section per profile.
-#
-# The split is the point: the repo says *which* credential, the machine holds the
-# credential itself. A clone is then ready to run without anyone pasting a key, and
-# nothing secret is ever a candidate for `git add`.
-#
-# Precedence is always environment first: CI injects INSIGHTEST_INGEST_API_KEY from
-# its own secret store, has neither file, and none of this runs.
-#
-# Both files are parsed, never sourced — a file that executes shell on every load
-# test is the risk the protected-name list exists to prevent.
-
-_k6w_credentials_file() {
-  if [[ -n "${INSIGHTEST_CREDENTIALS:-}" ]]; then
-    printf '%s' "${INSIGHTEST_CREDENTIALS}"
-    return
-  fi
-  printf '%s' "${XDG_CONFIG_HOME:-${HOME}/.config}/insightest/credentials"
-}
-
-# Trim surrounding whitespace and one layer of matching quotes.
-_k6w_trim() {
-  local s="${1%$'\r'}"
-  s="${s#"${s%%[![:space:]]*}"}"
-  s="${s%"${s##*[![:space:]]}"}"
-  if [[ ${#s} -ge 2 && "${s:0:1}" == '"' && "${s: -1}" == '"' ]]; then
-    s="${s:1:${#s}-2}"
-  elif [[ ${#s} -ge 2 && "${s:0:1}" == "'" && "${s: -1}" == "'" ]]; then
-    s="${s:1:${#s}-2}"
-  fi
-  printf '%s' "${s}"
-}
-
-# Read the committed per-repo file. Only non-secret settings are accepted here, and
-# a key found in it is fatal: the file is version-controlled, so a key in it is a
-# leaked key, and continuing would let that go unnoticed.
-_load_repo_config() {
-  local file="" dir="${PWD}"
-  while [[ -n "${dir}" ]]; do
-    if [[ -f "${dir}/.insightest" ]]; then
-      file="${dir}/.insightest"
-      break
-    fi
-    [[ "${dir}" == "/" ]] && break
-    dir="$(dirname "${dir}")"
-  done
-  [[ -n "${file}" ]] || return 0
-  if [[ ! -r "${file}" ]]; then
-    echo "[k6w] Warning: cannot read ${file}" >&2
-    return 0
-  fi
-
-  local line key value
-  while IFS= read -r line || [[ -n "${line}" ]]; do
-    line="$(_k6w_trim "${line}")"
-    [[ -z "${line}" || "${line}" == \#* || "${line}" == \;* || "${line}" != *=* ]] && continue
-    key="$(printf '%s' "${line%%=*}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
-    value="$(_k6w_trim "${line#*=}")"
-    case "${key}" in
-      profile)
-        [[ -z "${INSIGHTEST_PROFILE:-}" ]] && INSIGHTEST_PROFILE="${value}"
-        ;;
-      api_url)
-        [[ -z "${INSIGHTEST_API_URL:-}" ]] && INSIGHTEST_API_URL="${value}"
-        ;;
-      api_key | insightest_ingest_api_key)
-        echo "[k6w] Error: ${file} contains an API key." >&2
-        echo "[k6w]        That file is committed with the tests, so the key must be treated as" >&2
-        echo "[k6w]        leaked: revoke it in Insightest, issue a new one, and put the new one" >&2
-        echo "[k6w]        in $(_k6w_credentials_file) instead." >&2
-        exit 1
-        ;;
-      *)
-        echo "[k6w] Warning: ignoring unknown setting '${key}' in ${file}" >&2
-        ;;
-    esac
-  done < "${file}"
-}
-
-# Read the API key for the selected profile out of the per-machine credentials file.
-# Format is one section per profile:
-#
-#   [default]
-#   api_key = tk_…
-#
-#   [medical-apps]
-#   api_key = tk_…
-#
-# The profile is INSIGHTEST_PROFILE, else the `profile` line in .insightest, else
-# "default" — so a single-project machine names nothing anywhere.
-_load_api_key() {
-  # Already in the environment (CI secret, or an explicit one-off override).
-  [[ -n "${INSIGHTEST_INGEST_API_KEY:-}" ]] && return 0
-
-  local file; file="$(_k6w_credentials_file)"
-  [[ -f "${file}" ]] || return 0
-  if [[ ! -r "${file}" ]]; then
-    echo "[k6w] Warning: cannot read ${file}" >&2
-    return 0
-  fi
-
-  # A key readable by other accounts on the host is worth saying out loud, but not
-  # worth refusing to run over — the run would fail confusingly a moment later.
-  local mode
-  mode="$(stat -c '%a' "${file}" 2>/dev/null || stat -f '%Lp' "${file}" 2>/dev/null || printf '')"
-  if [[ -n "${mode}" && "${mode}" != "600" && "${mode}" != "400" ]]; then
-    echo "[k6w] Warning: ${file} is mode ${mode} and holds API keys — chmod 600 it" >&2
-  fi
-
-  local want="${INSIGHTEST_PROFILE:-default}" section="" line key value found=""
-  while IFS= read -r line || [[ -n "${line}" ]]; do
-    line="$(_k6w_trim "${line}")"
-    [[ -z "${line}" || "${line}" == \#* || "${line}" == \;* ]] && continue
-    if [[ "${line}" == \[*\] ]]; then
-      section="$(_k6w_trim "${line:1:${#line}-2}")"
-      continue
-    fi
-    [[ "${section}" == "${want}" && "${line}" == *=* ]] || continue
-    key="$(printf '%s' "${line%%=*}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
-    value="$(_k6w_trim "${line#*=}")"
-    [[ "${key}" == "api_key" ]] && found="${value}"
-  done < "${file}"
-
-  if [[ -z "${found}" ]]; then
-    echo "[k6w] Warning: no api_key for profile [${want}] in ${file}" >&2
-    return 0
-  fi
-  export INSIGHTEST_INGEST_API_KEY="${found}"
-  # Only the prefix, which is what Insightest itself displays for a key.
-  echo "[k6w] Using the API key for profile [${want}] (${found:0:10}…)"
-}
-
-_load_repo_config
-_load_api_key
-
-# The Insightest instance runs at a known address, so the wrapper ships with it
-# rather than making every caller repeat it. This is the one line to change if that
-# address ever moves — and moving it means cutting an SDK release and bumping the
-# dependency in each test repo, since this file is published as part of the SDK.
+# Fallback address, used only when neither the environment nor .insightest.env names
+# one. INSIGHTEST_API_URL belongs in .insightest.env, which is where a deployment
+# that has moved off localhost sets it — changing this line means cutting an SDK
+# release and bumping the dependency in every test repo, so the file is the answer
+# and this is just the local-stack default.
 #
 # Note this value is public: releases mirror SDKs/k6 to a public repository. Only
 # ever put an address here that is fine to publish; INSIGHTEST_INGEST_API_KEY is
@@ -217,7 +508,7 @@ _load_api_key
 K6W_DEFAULT_API_URL="http://localhost:4000"
 
 # Running against a local stack, a staging instance or a branch deployment is a
-# matter of overriding this one variable, or setting api_url in .insightest:
+# matter of the INSIGHTEST_API_URL line in .insightest.env, or overriding it once:
 #   INSIGHTEST_API_URL=http://localhost:4000 npx k6w run tests/load-test.js
 # Exported so it also lands in the run record, which is then explicit about which
 # Insightest the run registered against.
@@ -229,8 +520,8 @@ export INSIGHTEST_API_URL="${INSIGHTEST_API_URL:-${K6W_DEFAULT_API_URL}}"
 # read another's stored configuration — which is why INSIGHTEST_PROJECT is optional
 # once a key is set.
 #
-# By this point it has come from the environment or from the credentials file (see
-# _load_api_key). When it is still unset the calls go out without the header, which
+# By this point it has come from the environment or from .insightest.env (see
+# _load_env_file). When it is still unset the calls go out without the header, which
 # a deployment with keys configured rejects with 401.
 API_KEY_HEADER=()
 if [[ -n "${INSIGHTEST_INGEST_API_KEY:-}" ]]; then
@@ -249,7 +540,7 @@ K6W_ENV="${K6W_ENV:-default}"
 # or compromised API cannot push one to a newer wrapper.
 K6W_PROTECTED_ENV="PATH IFS ENV BASH_ENV SHELL HOME LD_PRELOAD LD_LIBRARY_PATH
 DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH NODE_OPTIONS K6W_K6_BIN K6W_SELF
-K6W_RUN_ID K6W_DOCKER_SOCKET INSIGHTEST_PROFILE INSIGHTEST_API_URL
+K6W_RUN_ID K6W_DOCKER_SOCKET K6W_ENV_FILE INSIGHTEST_PROFILE INSIGHTEST_API_URL
 INSIGHTEST_INGEST_API_KEY INSIGHTEST_CREDENTIALS INSIGHTEST_MASTER_KEY"
 
 # Names of variables Insightest flagged as secret. Collected by the config fetch
@@ -444,13 +735,19 @@ _do_rerun() {
 
 # ── Subcommand dispatch ───────────────────────────────────────────────────────
 # `rerun` re-runs a prior test locally; only `run` is instrumented; anything else
-# passes straight through to the real k6 binary.
+# passes straight through to the real k6 binary. (`init` and `install-k6` are handled
+# near the top, before the k6 binary is resolved — setup must work before k6 exists.)
 if [[ "${1:-}" == "rerun" ]]; then
   _do_rerun "${2:-}"   # execs `k6w run …`; never returns
 fi
 if [[ "${1:-}" != "run" ]]; then
   exec "${K6_BIN}" "$@"
 fi
+
+# A key sitting in a file git would happily commit is worth interrupting for, but
+# only on a real run — `k6w init` and pass-through k6 invocations have nothing to do
+# with it, and `k6w init` is the thing that fixes it.
+_warn_if_env_file_tracked
 
 # Load the project's stored configuration before anything reads the environment:
 # `k6 inspect` below, the container-stats collector (K6W_CONTAINER), the k6 output

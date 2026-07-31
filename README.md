@@ -1,13 +1,13 @@
 # k6 Performance Testing SDK
 
-[![version](https://img.shields.io/badge/version-1.1.3-blue.svg)](https://github.com/your-org/k6-perf-sdk/releases)
+[![version](https://img.shields.io/badge/version-1.1.5-blue.svg)](https://github.com/your-org/k6-perf-sdk/releases)
 
 A modular and reusable SDK for creating performance tests with k6. This SDK provides common test templates, configuration management, authentication helpers, HTTP and gRPC client utilities to streamline performance testing across multiple projects.
 
 ## Features
 
 - 📊 **Test Templates** - Pre-built templates for smoke, load, stress, and soak testing
-- ⚙️ **Dynamic Configuration** - Support for .env files, JSON config, and runtime variables
+- ⚙️ **Dynamic Configuration** - JSON config, runtime variables, and a per-repo `.insightest.env`
 - 🔐 **Authentication Helpers** - Common auth flows and token management
 - 🌐 **HTTP Client Wrapper** - Built-in logging, metrics, and error handling
 - 🔌 **gRPC Client Wrapper** - Full gRPC support with same ergonomics as HTTP
@@ -32,8 +32,19 @@ both give you the same `k6w` binary described below:
 npm install --save-dev /path/to/platform-tests/SDKs/k6
 
 # or from a packed tarball (run `npm pack` inside SDKs/k6 to produce it)
-npm install --save-dev ./k6-perf-sdk-1.1.2.tgz
+npm install --save-dev ./k6-perf-sdk-1.1.5.tgz
 ```
+
+Installing sets the repo up: it creates `.insightest.env`, adds it to `.gitignore`, and
+builds the k6 binary the SDK is pinned to. One command does the same thing by hand, and
+is the way in for any repo where install scripts don't run (see
+[When install scripts don't run](#when-install-scripts-dont-run)):
+
+```bash
+npx k6w init
+```
+
+After that, paste a project API key into `.insightest.env` and you can run tests.
 
 ## The `k6w` wrapper
 
@@ -51,23 +62,128 @@ npx k6w run tests/load-test.js
 npm run perf
 ```
 
-Anything that is not `run` (or the `rerun <run_id>` subcommand) is passed straight
-through to the real k6 binary, so `k6w inspect …`, `k6w version`, etc. behave as usual.
+Anything that is not `run` (or the `init` / `install-k6` / `rerun <run_id>` subcommands)
+is passed straight through to the real k6 binary, so `k6w inspect …`, `k6w version`,
+etc. behave as usual.
 
-`k6w` needs a k6 binary to delegate to — ideally the `xk6-clickhouse` build, or
-metrics never reach the dashboard. It looks for one in this order: `K6W_K6_BIN`, a
-`k6` next to the wrapper (including `node_modules/.bin/k6`), `k6` on PATH, then
-`./k6`. On CI the explicit override is the most predictable:
+### The k6 binary
+
+`k6w` delegates to a real k6 binary, and it has to be an `xk6-clickhouse` build — a
+stock k6 runs the test fine but streams no metrics, so the run never appears in the
+dashboard. `k6w install-k6` builds the right one:
+
+```bash
+npx k6w install-k6           # builds into tools/k6/k6 and gitignores it
+npx k6w install-k6 --force   # rebuild an existing one
+```
+
+It needs **Docker or Go**, not both, and nothing else:
+
+- **Docker** (preferred) uses `grafana/xk6`, so the host needs no Go toolchain at all.
+  That matters because the repos consuming this SDK are Node, Go and Python, and only
+  one of those can be assumed to have Go.
+- **A native `xk6`** on PATH is used when Docker isn't available.
+
+Either way the build is cross-compiled for the host's own `GOOS`/`GOARCH`. This is the
+one thing a hand-written `docker run grafana/xk6 build …` gets wrong away from Linux:
+the build happens inside a Linux container, so it produces a Linux binary that a macOS
+host cannot execute.
+
+The k6 version and the extension version are pinned together at the top of `bin/k6w`.
+They are coupled — the extension decides the shape of what lands in ClickHouse and
+Insightest reads that shape back — so a binary built from a different pairing can
+stream metrics that never show up, with nothing visibly wrong at either end. Changing
+either version means cutting an SDK release.
+
+Resolution order, first match wins: `K6W_K6_BIN`, a `k6` next to the wrapper
+(including `node_modules/.bin/k6`), `k6` on PATH, `tools/k6/k6` under the repo root,
+then `./k6`. A relative `K6W_K6_BIN` resolves against the directory holding
+`.insightest.env`, not the current directory, so runs from a subdirectory work.
+
+On CI, skip the build and export the path to a binary you already have:
 
 ```bash
 export K6W_K6_BIN=/usr/local/bin/k6
 export INSIGHTEST_API_URL=https://insightest.example.com   # only for a deployed Insightest
-export INSIGHTEST_INGEST_API_KEY=tk_…     # the project's API key
+export INSIGHTEST_INGEST_API_KEY=tk_…     # the project's API key, from CI secrets
 npx k6w run tests/load-test.js
 ```
 
 `INSIGHTEST_API_URL` defaults to `http://localhost:4000`, the local development
 API, so it only needs setting when Insightest runs somewhere else.
+
+### When install scripts don't run
+
+pnpm 10 and later refuse to run dependency install scripts unless the package is
+allowlisted, so in a pnpm repo the automatic setup does nothing and you get:
+
+```
+Ignored build scripts: k6-perf-sdk.
+Run "pnpm approve-builds" to pick which dependencies should be allowed to run scripts.
+```
+
+Two ways forward. Either allowlist it — in `pnpm-workspace.yaml` (or `package.json`
+under a `pnpm` key):
+
+```yaml
+onlyBuiltDependencies:
+  - 'k6-perf-sdk'
+```
+
+…or skip install scripts entirely and run the equivalent by hand, which does exactly
+the same work:
+
+```bash
+npx k6w init
+```
+
+The same applies anywhere `--ignore-scripts` is in effect, which is common in
+locked-down CI. Nothing about the SDK depends on the postinstall having run: `init` and
+`postinstall` do the same job, and `k6w run` tells you what's missing if neither did.
+
+### Configuring a repo
+
+Everything that is constant for the repo — which Insightest, which key, which k6
+binary — lives in one file, `.insightest.env`, at the root of the test repo. Installing
+the SDK creates it from a template and adds it to `.gitignore`; `npx k6w init` does the
+same by hand.
+
+```sh
+# .insightest.env — not committed, holds the project API key
+INSIGHTEST_API_URL=http://localhost:4000
+INSIGHTEST_PROJECT=91life_medical-apps
+INSIGHTEST_INGEST_API_KEY=tk_…
+K6W_K6_BIN=tools/k6/k6
+```
+
+With that in place a run carries only the choices that change from run to run:
+
+```bash
+K6W_CONTAINER=opensearch npx k6w run tests/load-test.js -o xk6-clickhouse
+```
+
+The file is found by walking up from the current directory, the way git finds its own
+config, so runs work from any subdirectory. `K6W_ENV_FILE` points at a different file.
+
+**Precedence is environment first.** A variable already set in your shell is never
+overwritten, so CI injects `INSIGHTEST_INGEST_API_KEY` from its own secret store, has
+no file, and none of this applies — and a one-off override still works:
+
+```bash
+INSIGHTEST_API_URL=http://localhost:9999 npx k6w run tests/load-test.js
+```
+
+An empty value in the file counts as unset, which is why the shipped template can ship
+`INSIGHTEST_INGEST_API_KEY=` blank.
+
+The file is parsed, never sourced — `KEY=VALUE` lines only, no command substitution,
+no shell. A file that executes shell on every load test is exactly the risk the
+protected-name list further down exists to prevent.
+
+Because it holds the key, it must not be committed. `k6w` checks: if the file carries
+a key and `git` does not ignore it, every run prints a loud warning naming the line to
+add to `.gitignore`. It warns rather than refuses — the key is not leaked yet, and the
+fix is one line.
 
 ### The project API key
 
@@ -76,60 +192,46 @@ authenticates the wrapper *and* selects the project, so there is nothing else to
 configure: a key issued for one project cannot register runs against another, read
 another project's stored configuration, or touch another project's runs.
 
-Get one from the project's **General** settings in Insightest — *Run performance
-tests* → *Copy setup command* hands you the `export` line to run on the load host.
-The same key is available from `POST /api/projects/{id}/api-keys` for scripted
-setup. Either way it takes project editor or owner (a superadmin, or an owner/admin
-of the project's organization, also qualifies), the raw value is shown exactly once,
-and only its sha256 is stored.
+A project has **one key, shared by everyone who works on it.** Get it from the
+project's **General** settings in Insightest — *Run performance tests* → *Copy token* —
+and paste it into the `INSIGHTEST_INGEST_API_KEY` line of your `.insightest.env`.
+Everyone with access sees the same value, so there is no reason to generate your own;
+`GET /api/projects/{id}/api-keys/token` is the same thing for scripted setup.
 
-That makes `INSIGHTEST_PROJECT` optional. If you do set it, it must name the key's
-own project — a mismatch is rejected rather than silently redirected, which catches
-a repo configured for one project holding another's key.
+Reading it takes project editor or owner (a superadmin, or an owner/admin of the
+project's organization, also qualifies). Viewers cannot: a key grants read of the
+project's stored configuration, including values marked secret.
 
-Revoke and rotate with `DELETE /api/projects/{id}/api-keys/{keyId}` — a project can
-hold several keys at once, so issue the new one, deploy it, then revoke the old.
-Issuing a key never invalidates an existing one, so a machine already set up keeps
-working when someone else copies a fresh command.
+The key is stored hashed *and* encrypted — hashed is what authentication checks,
+encrypted is what makes it displayable again. Keys issued before that was true still
+work but cannot be shown; the UI offers to replace one instead, and
+`GET .../api-keys/token` answers `409 token_not_retrievable` for it.
 
-#### Keeping the key off the command line
+**Rotating.** *Rotate* in the UI (or `POST /api/projects/{id}/api-keys`) issues a new
+key and does **not** revoke the old one, so nothing configured with the previous value
+breaks the moment somebody rotates. Revoke the old one explicitly with
+`DELETE /api/projects/{id}/api-keys/{keyId}` once everything is moved over.
 
-The `export` line from the UI lasts as long as the shell it was pasted into. For
-something durable, `k6w` also reads the key from two optional files, so a clone is
-ready to run and no secret is ever a candidate for `git add`:
+### The project key
 
-```ini
-# ~/.config/insightest/credentials — per machine, chmod 600, holds the keys
-[default]
-api_key = tk_…
+`INSIGHTEST_PROJECT` names the project a repo's tests belong to. Use the project's
+**project key** — a stable identifier like `91life_medical-apps`, shown next to the
+token in the UI. It is not a secret and does not authorize anything; the API key
+remains the credential.
 
-[medical-apps]
-api_key = tk_…
-```
+It is optional, because the API key already identifies the project. Two reasons to set
+it anyway:
 
-```ini
-# .insightest — committed with the tests. Says which key, never what it is.
-profile = medical-apps
-api_url = https://insightest.example.com   # optional
-```
+- **It catches the wrong key.** With both present, a repo holding another project's key
+  is rejected with a 403 instead of silently recording its runs against that other
+  project.
+- **It survives renames.** A project key is assigned when the project is created and is
+  never rewritten. Display names are only unique within an organization and change
+  whenever somebody renames a project, so configuration referring to a name used to
+  stop resolving without saying so.
 
-The repo names the credential; the machine holds it. `.insightest` is found by
-walking up from the current directory, so it works from any subdirectory, and the
-profile falls back to `default` when no repo file exists — a single-project machine
-configures nothing anywhere. Then:
-
-```bash
-npx k6w run tests/load-test.js -o xk6-clickhouse
-```
-
-Precedence is environment first, so CI is unaffected: it injects
-`INSIGHTEST_INGEST_API_KEY` from its own secret store, has neither file, and none of
-this runs. `INSIGHTEST_PROFILE` overrides the repo file for a one-off, and
-`INSIGHTEST_CREDENTIALS` points at a different key file.
-
-Both files are parsed, never sourced. A key written into the committed `.insightest`
-is a hard error rather than a warning — that file is version-controlled, so a key in
-it is already leaked and needs revoking, not ignoring.
+Names still resolve, for repos configured before project keys existed: `name`, or
+`organization/name` to disambiguate a name used in more than one organization.
 
 Older deployments used a single shared `INSIGHTEST_INGEST_API_KEY` for every
 project, set on the server. That still works and still honours `INSIGHTEST_PROJECT`,
@@ -155,12 +257,13 @@ metrics store is. Everything else is stored per project and managed through
 script needs, and so on. Values can be marked secret, in which case they are
 encrypted at rest and masked everywhere except this response.
 
-Keep per-run choices out of it. `K6W_CONTAINER` is the clearest example: which
-container to sample depends on what you are testing right now, so it belongs on the
-command line even though the mechanism would happily store it.
+Keep per-run choices out of it — out of `.insightest.env` too. `K6W_CONTAINER` is the
+clearest example: which container to sample depends on what you are testing right now,
+so it belongs on the command line even though both mechanisms would happily store it.
+A value you change every run is a value you should not have to open a file to change.
 
-**A local value always wins.** `k6w` only fills in variables that are unset in your
-shell, so pointing a run at a local stack still works:
+**A local value always wins.** `k6w` only fills in variables that are unset — by your
+shell or by `.insightest.env` — so pointing a run at a local stack still works:
 
 ```bash
 HTTP_HOST=http://localhost:9200 npx k6w run tests/load-test.js
@@ -236,20 +339,26 @@ The SDK supports multiple configuration methods:
 
 ### Environment Variables
 
-You can use environment variables with `.env` files or k6's `__ENV` variables:
+The SDK's config helpers read k6's `__ENV`, which k6 populates from the host
+environment. So a variable your script needs can come from `.insightest.env` when you
+run through `k6w`:
 
-```
-# .env file
+```sh
+# .insightest.env
 BASE_URL=https://api.example.com
 AUTH_TYPE=bearer
 AUTH_TOKEN=your-token-here
 ```
 
-Or pass them when running k6:
+from the shell, or from k6's own flag:
 
 ```bash
 k6 run script.js -e BASE_URL=https://api.example.com -e AUTH_TOKEN=your-token-here
 ```
+
+Note that the SDK modules themselves do not parse any file — `config/env.js` reads
+`__ENV` (or `process.env` outside k6) and nothing else. `.insightest.env` is loaded by
+the `k6w` wrapper, which exports its contents before starting k6.
 
 ## Test Templates
 
